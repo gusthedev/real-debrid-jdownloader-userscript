@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.1.0
-// @description  Adds Real-Debrid OAuth and JDownloader controls beside supported host links using loader-provided configuration.
+// @version      7.2.0
+// @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
 // @exclude      *://*.mdblist.com/*
@@ -30,6 +30,7 @@
   const HOST_CACHE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
   const TOKEN_EXPIRY_MARGIN = 60 * 1000;
   const REQUEST_TIMEOUT = 20_000;
+  const JDOWNLOADER_STATUS_TIMEOUT = 8_000;
 
   function normalizeHostname(hostname) {
     return String(hostname || '').toLowerCase().replace(/^\.+|\.+$/g, '');
@@ -161,6 +162,81 @@
         },
         onerror: () => reject(new RequestError('Network error while contacting Real-Debrid.')),
         ontimeout: () => reject(new RequestError('Real-Debrid did not respond in time.'))
+      });
+    });
+  }
+
+  function normalizeDownloadUrls(values) {
+    const candidates = Array.isArray(values) ? values : [values];
+    const urls = [];
+    for (const value of candidates) {
+      try {
+        const url = new URL(String(value || ''), location.href);
+        if (url.protocol === 'http:' || url.protocol === 'https:') urls.push(url.href);
+      } catch {
+        // Invalid and non-web links cannot be sent to JDownloader.
+      }
+    }
+    return [...new Set(urls)];
+  }
+
+  function requestJDownloader(values, options = {}) {
+    const {
+      allowEmpty = false,
+      source = 'Tampermonkey',
+      timeout = REQUEST_TIMEOUT
+    } = options;
+    const urls = normalizeDownloadUrls(values);
+    if (!urls.length && !allowEmpty) {
+      return Promise.reject(new RequestError('No valid download links were provided to JDownloader.'));
+    }
+    const data = new URLSearchParams({ source, urls: urls.join('\r\n') }).toString();
+
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: config.jdownloaderEndpoint,
+        headers: {
+          Accept: 'text/plain, */*',
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+        },
+        data,
+        timeout,
+        onload: response => {
+          const finalUrl = String(response.finalUrl || config.jdownloaderEndpoint);
+          let stayedOnEndpoint = false;
+          try {
+            stayedOnEndpoint = new URL(finalUrl).origin === new URL(config.jdownloaderEndpoint).origin;
+          } catch {
+            // An invalid final URL cannot be trusted as an accepted request.
+          }
+          if (!stayedOnEndpoint) {
+            reject(new RequestError('The JDownloader request was redirected away from the configured endpoint. Check its authentication or proxy configuration.'));
+            return;
+          }
+
+          if (response.status >= 200 && response.status < 300) {
+            const interfaceResult = String(response.responseText || '').trim().toLowerCase();
+            if (interfaceResult !== 'success' && interfaceResult !== 'failed') {
+              reject(new RequestError('The endpoint returned an unexpected response instead of JDownloader\'s success/failed result.', response.status));
+              return;
+            }
+            if (!allowEmpty && interfaceResult !== 'success') {
+              reject(new RequestError('JDownloader received the request but did not accept the download links.', response.status));
+              return;
+            }
+            resolve({ status: response.status, finalUrl, interfaceResult });
+            return;
+          }
+          const status = response.status ? `HTTP ${response.status}` : 'an unknown HTTP error';
+          const detail = String(response.statusText || '').trim();
+          reject(new RequestError(`The JDownloader endpoint returned ${status}${detail ? ` (${detail})` : ''}.`, response.status));
+        },
+        onerror: () => reject(new RequestError(
+          'The JDownloader request failed. Confirm that the endpoint is online and its hostname is allowed by the loader\'s @connect setting.'
+        )),
+        ontimeout: () => reject(new RequestError('The JDownloader endpoint did not respond in time.')),
+        onabort: () => reject(new RequestError('The JDownloader request was cancelled.'))
       });
     });
   }
@@ -441,6 +517,103 @@
     return false;
   }
 
+  function collectSupportedLinks(root = document) {
+    const links = root.querySelectorAll('a[href]');
+    return [...new Set(
+      [...links]
+        .map(link => link.href)
+        .filter(url => isSupportedUrl(url))
+    )];
+  }
+
+  function formatDuration(milliseconds) {
+    if (!Number.isFinite(milliseconds)) return 'unknown';
+    const totalMinutes = Math.max(0, Math.ceil(milliseconds / 60_000));
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    if (days) return `${days}d ${hours}h`;
+    if (hours) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  function describeOAuthStatus(now = Date.now()) {
+    const session = readOAuthSession();
+    const hasRefreshCredentials = Boolean(session.clientId && session.clientSecret && session.refreshToken);
+    const accessTokenIsCurrent = Boolean(session.accessToken && session.expiresAt > now);
+    const expiry = session.expiresAt > 0 ? new Date(session.expiresAt).toLocaleString() : 'unknown';
+
+    if (accessTokenIsCurrent && hasRefreshCredentials) {
+      return `connected; access token expires ${expiry} (in ${formatDuration(session.expiresAt - now)}); automatic refresh is available`;
+    }
+    if (hasRefreshCredentials) {
+      return `connected; access token ${session.expiresAt > 0 ? `expired ${expiry}` : 'is not currently saved'}; automatic refresh is available`;
+    }
+    if (accessTokenIsCurrent) {
+      return `partially connected; access token expires ${expiry}, but refresh credentials are incomplete`;
+    }
+    if (session.clientId || session.clientSecret || session.accessToken || session.refreshToken || session.expiresAt) {
+      return 'not connected; an incomplete saved OAuth session should be replaced using the reconnect command';
+    }
+    return 'not connected';
+  }
+
+  function describeHostCache(now = Date.now()) {
+    const hosts = normalizeHostList(GM_getValue(STORAGE.hosts, []));
+    const lastUpdated = Number(GM_getValue(STORAGE.hostsUpdated, 0)) || 0;
+    if (!hosts.length || !lastUpdated) return `empty (${hosts.length} hosts)`;
+    const age = Math.max(0, now - lastUpdated);
+    const state = age < HOST_CACHE_MAX_AGE ? 'fresh' : 'stale';
+    return `${state} (${hosts.length} hosts; updated ${new Date(lastUpdated).toLocaleString()}, ${formatDuration(age)} ago)`;
+  }
+
+  async function showConnectionStatus() {
+    const endpointUrl = new URL(config.jdownloaderEndpoint);
+    const lines = [
+      `Real-Debrid OAuth: ${describeOAuthStatus()}`,
+      `Supported-host cache: ${describeHostCache()}`,
+      `JDownloader endpoint hostname: ${endpointUrl.host}`,
+      'JDownloader check: checking…'
+    ];
+    console.info(`[RD + JD] ${lines.join('\n')}`);
+
+    try {
+      const response = await requestJDownloader([], {
+        allowEmpty: true,
+        source: 'Tampermonkey status check',
+        timeout: JDOWNLOADER_STATUS_TIMEOUT
+      });
+      lines[3] = `JDownloader check: interface reachable (HTTP ${response.status}; ${response.interfaceResult})`;
+    } catch (error) {
+      lines[3] = `JDownloader check: failed — ${error.message}`;
+    }
+    window.alert(lines.join('\n'));
+  }
+
+  async function sendPageLinksToJDownloader() {
+    try {
+      await loadSupportedHosts();
+    } catch (error) {
+      window.alert(`Supported links could not be identified.\n\n${error.message}`);
+      return;
+    }
+
+    const urls = collectSupportedLinks();
+    if (!urls.length) {
+      window.alert('No unique Real-Debrid-supported links were found on this page.');
+      return;
+    }
+    const endpointHost = new URL(config.jdownloaderEndpoint).host;
+    if (!window.confirm(`Send ${urls.length} unique supported link${urls.length === 1 ? '' : 's'} from this page to JDownloader at ${endpointHost}?`)) return;
+
+    try {
+      const response = await requestJDownloader(urls);
+      window.alert(`${urls.length} unique supported link${urls.length === 1 ? ' was' : 's were'} accepted by JDownloader (HTTP ${response.status}; ${response.interfaceResult}).`);
+    } catch (error) {
+      window.alert(`The page links could not be sent to JDownloader.\n\n${error.message}`);
+    }
+  }
+
   function setButtonState(button, text, disabled) {
     button.textContent = text;
     button.disabled = disabled;
@@ -533,26 +706,17 @@
     }
   }
 
-  function sendToJDownloader(url, button) {
+  async function sendToJDownloader(url, button) {
     setButtonState(button, '⏳', true);
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = config.jdownloaderEndpoint;
-    form.target = '_blank';
-    form.rel = 'noopener noreferrer';
-    form.style.display = 'none';
-    for (const [name, value] of Object.entries({ source: 'Tampermonkey', urls: url })) {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = name;
-      input.value = value;
-      form.appendChild(input);
+    try {
+      await requestJDownloader(url);
+      setButtonState(button, '✅', true);
+      window.setTimeout(() => setButtonState(button, '📥', false), 1800);
+    } catch (error) {
+      setButtonState(button, '⚠️', true);
+      window.alert(`The link could not be sent to JDownloader.\n\n${error.message}`);
+      window.setTimeout(() => setButtonState(button, '📥', false), 1800);
     }
-    document.body.appendChild(form);
-    form.submit();
-    window.setTimeout(() => form.remove(), 1000);
-    setButtonState(button, '✅', true);
-    window.setTimeout(() => setButtonState(button, '📥', false), 1800);
   }
 
   function removeExistingControls(link) {
@@ -583,7 +747,7 @@
     jdButton.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      sendToJDownloader(link.href, jdButton);
+      void sendToJDownloader(link.href, jdButton);
     });
     container.append(rdButton, jdButton);
     link.after(container);
@@ -599,16 +763,21 @@
 
   function flushPendingRoots() {
     processTimer = null;
-    const roots = [...pendingRoots];
+    const roots = [...pendingRoots].filter(root => root.isConnected);
     pendingRoots.clear();
-    roots.forEach(processRoot);
+    roots
+      .filter(root => !roots.some(candidate => candidate !== root && candidate.contains(root)))
+      .forEach(processRoot);
   }
 
   function scheduleRoot(root) {
     if (!(root instanceof Element)) return;
+    for (const pendingRoot of pendingRoots) {
+      if (pendingRoot.contains(root)) return;
+      if (root.contains(pendingRoot)) pendingRoots.delete(pendingRoot);
+    }
     pendingRoots.add(root);
-    window.clearTimeout(processTimer);
-    processTimer = window.setTimeout(flushPendingRoots, 150);
+    if (processTimer === null) processTimer = window.setTimeout(flushPendingRoots, 150);
   }
 
   function startObserver() {
@@ -664,6 +833,12 @@
       } catch (error) {
         window.alert(`The supported-host list could not be refreshed.\n\n${error.message}`);
       }
+    });
+    GM_registerMenuCommand('Send all supported page links to JDownloader', () => {
+      void sendPageLinksToJDownloader();
+    });
+    GM_registerMenuCommand('Show status and test JDownloader endpoint', () => {
+      void showConnectionStatus();
     });
   }
 

@@ -1,0 +1,7 @@
+{
+  "name": "real-debrid-jdownloader-userscript",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
