@@ -726,8 +726,24 @@
     injectedControls.delete(link);
   }
 
+  // Page nodes and userscript wrappers need not share this realm's DOM constructors.
+  function isElementNode(node) {
+    return Boolean(node && node.nodeType === 1
+      && typeof node.matches === 'function'
+      && typeof node.querySelectorAll === 'function'
+      && typeof node.contains === 'function');
+  }
+
+  function isAnchorNode(node) {
+    return isElementNode(node)
+      && typeof node.tagName === 'string' && node.tagName.toLowerCase() === 'a'
+      && typeof node.href === 'string'
+      && typeof node.hasAttribute === 'function'
+      && typeof node.after === 'function';
+  }
+
   function processLink(link) {
-    if (!(link instanceof HTMLAnchorElement) || !link.hasAttribute('href')) return;
+    if (!isAnchorNode(link) || !link.hasAttribute('href')) return;
     const currentUrl = link.href;
     const existing = injectedControls.get(link);
     const supported = isSupportedUrl(currentUrl);
@@ -755,7 +771,7 @@
   }
 
   function processRoot(root) {
-    if (!(root instanceof Element)) return;
+    if (!isElementNode(root)) return;
     if (root.matches('[data-rd-jd-controls]')) return;
     if (root.matches('a[href]')) processLink(root);
     root.querySelectorAll('a[href]').forEach(processLink);
@@ -771,7 +787,7 @@
   }
 
   function scheduleRoot(root) {
-    if (!(root instanceof Element)) return;
+    if (!isElementNode(root)) return;
     for (const pendingRoot of pendingRoots) {
       if (pendingRoot.contains(root)) return;
       if (root.contains(pendingRoot)) pendingRoots.delete(pendingRoot);

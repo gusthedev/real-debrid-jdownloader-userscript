@@ -19,6 +19,79 @@ async function settle() {
   await tick();
 }
 
+// Plain wrappers deliberately have no relationship to the constructors in the VM.
+function createElementWrapper(tagName = 'div') {
+  return {
+    nodeType: 1,
+    tagName: tagName.toUpperCase(),
+    children: [],
+    isConnected: true,
+    scanCount: 0,
+    attributes: new Map(),
+    dataset: {},
+    style: {},
+    listeners: new Map(),
+    nextSibling: null,
+    contains(candidate) {
+      return candidate === this || this.children.some(child => child.contains(candidate));
+    },
+    hasAttribute(name) {
+      return this.attributes.has(name);
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+      if (name === 'href') this.href = String(value);
+    },
+    matches(selector) {
+      if (selector === 'a[href]') return this.tagName === 'A' && this.hasAttribute('href');
+      if (selector === '[data-rd-jd-controls]') return this.dataset.rdJdControls !== undefined;
+      return false;
+    },
+    querySelectorAll(selector) {
+      this.scanCount += 1;
+      const collect = element => element.children.flatMap(child => [
+        ...(child.matches(selector) ? [child] : []),
+        ...collect(child)
+      ]);
+      return collect(this);
+    },
+    addEventListener(type, listener) {
+      this.listeners.set(type, listener);
+    },
+    append(...children) {
+      this.children.push(...children);
+    },
+    after(node) {
+      this.nextSibling = node;
+      node.previousSibling = this;
+    },
+    remove() {
+      this.removed = true;
+      if (this.previousSibling) this.previousSibling.nextSibling = null;
+    }
+  };
+}
+
+function createAnchorWrapper(href) {
+  const anchor = createElementWrapper('a');
+  anchor.href = '';
+  if (href !== undefined) anchor.setAttribute('href', href);
+  return anchor;
+}
+
+function assertControls(link) {
+  const container = link.nextSibling;
+  assert.ok(container, 'supported anchor should have controls');
+  assert.equal(container.tagName, 'SPAN');
+  assert.equal(container.dataset.rdJdControls, 'true');
+  assert.deepEqual(container.children.map(button => button.textContent), ['🔗', '📥']);
+  for (const button of container.children) {
+    assert.equal(button.type, 'button');
+    assert.equal(typeof button.listeners.get('click'), 'function');
+  }
+  return container;
+}
+
 function createHarness(options = {}) {
   const now = Date.now();
   const storage = new Map(Object.entries({
@@ -33,31 +106,24 @@ function createHarness(options = {}) {
   let mutationCallback = null;
 
   class FakeElement {
-    constructor() {
-      this.children = [];
-      this.isConnected = true;
-      this.scanCount = 0;
-    }
-
-    contains(candidate) {
-      return candidate === this || this.children.some(child => child.contains(candidate));
-    }
-
-    matches() {
-      return false;
-    }
-
-    querySelectorAll() {
-      this.scanCount += 1;
-      return [];
+    constructor(tagName) {
+      Object.assign(this, createElementWrapper(tagName));
     }
   }
 
-  class FakeAnchor extends FakeElement {}
+  class FakeAnchor extends FakeElement {
+    constructor() {
+      super('a');
+      this.href = '';
+    }
+  }
 
   const document = {
     body: new FakeElement(),
-    links: [],
+    links: options.links || [],
+    createElement(tagName) {
+      return tagName === 'a' ? new FakeAnchor() : new FakeElement(tagName);
+    },
     querySelectorAll() {
       return this.links;
     }
@@ -126,6 +192,7 @@ function createHarness(options = {}) {
   vm.runInNewContext(coreSource, context, { filename: corePath });
   return {
     FakeElement,
+    FakeAnchor,
     alerts,
     confirmations,
     document,
@@ -269,4 +336,107 @@ test('mutation batching prunes a pending child when its parent is also pending',
 
   assert.equal(parent.scanCount, 1);
   assert.equal(child.scanCount, 0);
+});
+
+test('initial scan processes wrapped anchors while preserving anchor and supported-host filtering', async () => {
+  const supported = createAnchorWrapper('https://files.example/a');
+  const subdomain = createAnchorWrapper('https://cdn.files.example/b');
+  const ordinaryElement = createElementWrapper();
+  ordinaryElement.setAttribute('href', supported.href);
+  const rejected = [
+    ordinaryElement,
+    createAnchorWrapper(),
+    createAnchorWrapper('https://unsupported.example/a'),
+    createAnchorWrapper('https://notfiles.example/a'),
+    createAnchorWrapper('https://files.example.evil.example/a'),
+    createAnchorWrapper('ftp://files.example/a'),
+    Object.assign(createAnchorWrapper(supported.href), { nodeType: 3 }),
+    Object.assign(createAnchorWrapper(supported.href), { href: { baseVal: supported.href } })
+  ];
+  const harness = createHarness({ links: [supported, subdomain, ...rejected] });
+  assert.equal(supported instanceof harness.FakeElement, false);
+  assert.equal(supported instanceof harness.FakeAnchor, false);
+  const sameRealmAnchor = new harness.FakeAnchor();
+  sameRealmAnchor.setAttribute('href', 'https://files.example/same-realm');
+  harness.document.links.push(sameRealmAnchor);
+  await settle();
+
+  [supported, subdomain, sameRealmAnchor].forEach(assertControls);
+  rejected.forEach(node => assert.equal(node.nextSibling, null));
+  assert.equal(typeof harness.getMutationCallback(), 'function');
+  assert.equal(harness.requests.length, 0);
+});
+
+test('mutation-added wrapped roots process anchors and skip non-elements and injected controls', async () => {
+  const harness = createHarness();
+  await settle();
+  const direct = createAnchorWrapper('https://files.example/direct');
+  const nested = createAnchorWrapper('https://files.example/nested');
+  const root = createElementWrapper();
+  root.append(nested);
+  const injected = createElementWrapper('span');
+  injected.dataset.rdJdControls = 'true';
+  const injectedLink = createAnchorWrapper('https://files.example/injected');
+  injected.append(injectedLink);
+  const disconnected = createAnchorWrapper('https://files.example/disconnected');
+  disconnected.isConnected = false;
+  const nonElements = [3, 9, 11].map(nodeType => Object.assign(createElementWrapper(), { nodeType }));
+  assert.equal(root instanceof harness.FakeElement, false);
+  assert.equal(direct instanceof harness.FakeAnchor, false);
+
+  harness.getMutationCallback()([{
+    type: 'childList',
+    addedNodes: [direct, nested, root, injected, disconnected, ...nonElements, null, {}, { nodeType: 1 }]
+  }]);
+  await new Promise(resolve => setTimeout(resolve, 180));
+
+  const directControls = assertControls(direct);
+  assertControls(nested);
+  assert.equal(root.scanCount, 1);
+  assert.equal(nested.scanCount, 0, 'pending parent should subsume the nested anchor scan');
+  assert.equal(injected.scanCount, 0);
+  assert.equal(injectedLink.nextSibling, null);
+  assert.equal(disconnected.nextSibling, null);
+  nonElements.forEach(node => assert.equal(node.scanCount, 0));
+
+  harness.getMutationCallback()([{ type: 'childList', addedNodes: [direct, directControls] }]);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(direct.nextSibling, directControls, 'rescanning must not duplicate controls');
+  assert.equal(directControls.scanCount, 0);
+});
+
+test('href mutations on wrapped anchors add, retain, replace, and remove controls', async () => {
+  const link = createAnchorWrapper('https://unsupported.example/a');
+  const harness = createHarness({ links: [link] });
+  await settle();
+  assert.equal(link instanceof harness.FakeAnchor, false);
+  assert.equal(link.nextSibling, null);
+  const mutateHref = () => harness.getMutationCallback()([{
+    type: 'attributes', attributeName: 'href', target: link
+  }]);
+
+  link.setAttribute('href', 'https://files.example/a');
+  mutateHref();
+  const originalControls = assertControls(link);
+  mutateHref();
+  assert.equal(link.nextSibling, originalControls);
+
+  link.setAttribute('href', 'https://files.example/b');
+  mutateHref();
+  const replacementControls = assertControls(link);
+  assert.notEqual(replacementControls, originalControls);
+  assert.equal(originalControls.removed, true);
+
+  link.setAttribute('href', 'https://unsupported.example/b');
+  mutateHref();
+  assert.equal(link.nextSibling, null);
+  assert.equal(replacementControls.removed, true);
+
+  const ordinaryElement = createElementWrapper();
+  ordinaryElement.setAttribute('href', 'https://files.example/not-an-anchor');
+  harness.getMutationCallback()([{
+    type: 'attributes', attributeName: 'href', target: ordinaryElement
+  }]);
+  assert.equal(ordinaryElement.nextSibling, null);
+  assert.equal(harness.requests.length, 0);
 });
