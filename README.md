@@ -40,3 +40,11 @@ Run the dependency-free Node test suite with:
 ```sh
 npm test
 ```
+
+Pull requests that change `real-debrid-jdownloader.user.js` must change its semantic `@version` relative to the PR base. CI compares the tested PR merge result with its exact base, fetching only that base at depth one; dependency-only (including Dependabot), workflow-only, documentation-only, and loader-only changes do not require a core bump. Only bump a loader version when that loader changes.
+
+To run the same check locally with the base and candidate commits available locally (CI uses the PR merge commit as the candidate):
+
+```sh
+node scripts/check-shared-core-version.cjs <base-sha> <candidate-sha> real-debrid-jdownloader.user.js
+```
