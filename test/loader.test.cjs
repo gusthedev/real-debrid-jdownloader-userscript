@@ -33,7 +33,9 @@ function runLoader(storageValues = {}) {
   const requests = [];
   const menus = new Map();
   const alerts = [];
+  let syntaxChecks = 0;
   const context = {
+    Function: function (source) { syntaxChecks++; return new Function(source); },
     Date: class extends Date { static now() { return NOW; } },
     console: { error() {}, info() {}, warn() {} },
     window: { alert: message => alerts.push(String(message)) },
@@ -45,7 +47,7 @@ function runLoader(storageValues = {}) {
   };
   vm.runInNewContext(loaderSource, context, { filename: 'loader.user.js' });
   return {
-    alerts, context, requests, storage,
+    alerts, context, requests, storage, syntaxChecks: () => syntaxChecks,
     checkManually: () => menus.get('Check for shared-core updates now')(),
     runs: () => Array.from(context.__coreRuns || [])
   };
@@ -265,4 +267,10 @@ test('failed manual checks preserve the active cache and allow another check', (
     h.checkManually();
     assert.equal(h.requests.length, 2);
   }
+});
+
+test('warm startup validates cached source only once', () => {
+  const h = runLoader({ [STORAGE.source]: core(), [STORAGE.lastAttempt]: NOW });
+  assert.equal(h.syntaxChecks(), 1);
+  assert.equal(h.runs().length, 1);
 });

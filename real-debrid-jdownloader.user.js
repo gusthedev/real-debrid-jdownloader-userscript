@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.1
+// @version      7.2.2
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -108,7 +108,6 @@
   }
 
   let supportedDomains = new Set();
-  let observer = null;
   let processTimer = null;
   let oauthConnectionPromise = null;
   let oauthRefreshPromise = null;
@@ -116,12 +115,11 @@
   const injectedControls = new WeakMap();
 
   class RequestError extends Error {
-    constructor(message, status = 0, apiCode = null, details = null) {
+    constructor(message, status = 0, apiCode = null) {
       super(String(message || 'Unknown error'));
       this.name = 'RequestError';
       this.status = status;
       this.apiCode = apiCode;
-      this.details = details;
     }
   }
 
@@ -158,7 +156,7 @@
             || (typeof body?.error === 'string' ? body.error : '')
             || response.statusText
             || `HTTP ${response.status}`;
-          reject(new RequestError(apiMessage, response.status, apiCode, body));
+          reject(new RequestError(apiMessage, response.status, apiCode));
         },
         onerror: () => reject(new RequestError('Network error while contacting Real-Debrid.')),
         ontimeout: () => reject(new RequestError('Real-Debrid did not respond in time.'))
@@ -257,7 +255,7 @@
 
   function saveOAuthSession(credentials, tokens) {
     const accessToken = String(tokens?.access_token || '');
-    const refreshToken = String(tokens?.refresh_token || readOAuthSession().refreshToken || '');
+    const refreshToken = String(tokens?.refresh_token || GM_getValue(STORAGE.refreshToken, '') || '');
     const expiresIn = Number(tokens?.expires_in) || 0;
 
     if (!credentials.clientId || !credentials.clientSecret || !accessToken || !refreshToken || expiresIn <= 0) {
@@ -518,12 +516,11 @@
   }
 
   function collectSupportedLinks(root = document) {
-    const links = root.querySelectorAll('a[href]');
-    return [...new Set(
-      [...links]
-        .map(link => link.href)
-        .filter(url => isSupportedUrl(url))
-    )];
+    const urls = new Set();
+    for (const link of root.querySelectorAll('a[href]')) {
+      if (!urls.has(link.href) && isSupportedUrl(link.href)) urls.add(link.href);
+    }
+    return [...urls];
   }
 
   function formatDuration(milliseconds) {
@@ -711,19 +708,12 @@
     try {
       await requestJDownloader(url);
       setButtonState(button, '✅', true);
-      window.setTimeout(() => setButtonState(button, '📥', false), 1800);
     } catch (error) {
       setButtonState(button, '⚠️', true);
       window.alert(`The link could not be sent to JDownloader.\n\n${error.message}`);
+    } finally {
       window.setTimeout(() => setButtonState(button, '📥', false), 1800);
     }
-  }
-
-  function removeExistingControls(link) {
-    const existing = injectedControls.get(link);
-    if (!existing) return;
-    existing.container.remove();
-    injectedControls.delete(link);
   }
 
   // Page nodes and userscript wrappers need not share this realm's DOM constructors.
@@ -748,7 +738,10 @@
     const existing = injectedControls.get(link);
     const supported = isSupportedUrl(currentUrl);
     if (existing?.url === currentUrl && link.nextSibling === existing.container && supported) return;
-    if (existing) removeExistingControls(link);
+    if (existing) {
+      existing.container.remove();
+      injectedControls.delete(link);
+    }
     if (!supported) return;
     const container = document.createElement('span');
     container.dataset.rdJdControls = 'true';
@@ -772,7 +765,6 @@
 
   function processRoot(root) {
     if (!isElementNode(root)) return;
-    if (root.matches('[data-rd-jd-controls]')) return;
     if (root.matches('a[href]')) processLink(root);
     root.querySelectorAll('a[href]').forEach(processLink);
   }
@@ -787,17 +779,13 @@
   }
 
   function scheduleRoot(root) {
-    if (!isElementNode(root)) return;
-    for (const pendingRoot of pendingRoots) {
-      if (pendingRoot.contains(root)) return;
-      if (root.contains(pendingRoot)) pendingRoots.delete(pendingRoot);
-    }
+    if (!isElementNode(root) || root.matches('[data-rd-jd-controls]')) return;
     pendingRoots.add(root);
     if (processTimer === null) processTimer = window.setTimeout(flushPendingRoots, 150);
   }
 
   function startObserver() {
-    observer = new MutationObserver(mutations => {
+    const observer = new MutationObserver(mutations => {
       for (const mutation of mutations) {
         if (mutation.type === 'attributes') {
           processLink(mutation.target);

@@ -27,7 +27,7 @@ This repository contains the shared, endpoint-free core for a Tampermonkey users
 
 The loader periodically checks this repository for an updated core and keeps a last-known-good cached copy for offline or GitHub-outage fallback. This makes the GitHub repository a trusted code source; review repository changes and protect the GitHub account with strong authentication.
 
-Loader 1.1.1 fetches the current `main` core through GitHub's Contents API with raw media and requires a valid semantic `@version` in its userscript header. It retains the hourly update interval (five-minute retries without a cached core). **Check for shared-core updates now** bypasses caching and revalidates the stored ETag; a changed core is saved for the next page load.
+Loader 1.1.2 fetches the current `main` core through GitHub's Contents API with raw media and requires a valid semantic `@version` in its userscript header. It retains the hourly update interval (five-minute retries without a cached core). **Check for shared-core updates now** bypasses caching and revalidates the stored ETag; a changed core is saved for the next page load.
 
 When upgrading an existing local loader, preserve your private endpoint, endpoint `@connect` hostname, and `excludedDomains`. Change the GitHub `@connect` entry from `raw.githubusercontent.com` to `api.github.com` along with the loader code; updating the shared core alone does not update your locally installed loader.
 

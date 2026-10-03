@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader Loader
 // @namespace    local.real-debrid.jdownloader.loader
-// @version      1.1.1
+// @version      1.1.2
 // @description  Loads the shared Real-Debrid/JDownloader script with private local configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -106,8 +106,9 @@
     return '';
   }
 
+  // Callers validate source when reading the cache or receiving an update.
   function executeSharedCore(source) {
-    if (executionAttempted || !isValidSharedCore(source)) return false;
+    if (executionAttempted) return false;
     executionAttempted = true;
     try {
       eval(`${source}\n//# sourceURL=real-debrid-jdownloader.user.js`);
