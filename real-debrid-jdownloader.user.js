@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.0
+// @version      7.2.1
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*

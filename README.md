@@ -27,6 +27,10 @@ This repository contains the shared, endpoint-free core for a Tampermonkey users
 
 The loader periodically checks this repository for an updated core and keeps a last-known-good cached copy for offline or GitHub-outage fallback. This makes the GitHub repository a trusted code source; review repository changes and protect the GitHub account with strong authentication.
 
+Loader 1.1.1 fetches the current `main` core through GitHub's Contents API with raw media and requires a valid semantic `@version` in its userscript header. It retains the hourly update interval (five-minute retries without a cached core). **Check for shared-core updates now** bypasses caching and revalidates the stored ETag; a changed core is saved for the next page load.
+
+When upgrading an existing local loader, preserve your private endpoint, endpoint `@connect` hostname, and `excludedDomains`. Change the GitHub `@connect` entry from `raw.githubusercontent.com` to `api.github.com` along with the loader code; updating the shared core alone does not update your locally installed loader.
+
 ## Stored values
 
 Tampermonkey stores the supported-host cache and the Real-Debrid OAuth client ID, generated client secret, access token, refresh token, and expiry time. These values are never part of this repository.
@@ -39,4 +43,12 @@ Run the dependency-free Node test suite with:
 
 ```sh
 npm test
+```
+
+Pull requests that change `real-debrid-jdownloader.user.js` must change its semantic `@version` relative to the PR base. CI compares the tested PR merge result with its exact base, fetching only that base at depth one; dependency-only (including Dependabot), workflow-only, documentation-only, and loader-only changes do not require a core bump. Only bump a loader version when that loader changes.
+
+To run the same check locally with the base and candidate commits available locally (CI uses the PR merge commit as the candidate):
+
+```sh
+node scripts/check-shared-core-version.cjs <base-sha> <candidate-sha> real-debrid-jdownloader.user.js
 ```
