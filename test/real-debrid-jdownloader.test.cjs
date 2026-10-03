@@ -440,3 +440,18 @@ test('href mutations on wrapped anchors add, retain, replace, and remove control
   assert.equal(ordinaryElement.nextSibling, null);
   assert.equal(harness.requests.length, 0);
 });
+
+test('a burst of sibling roots is deduplicated once before scanning', async () => {
+  const harness = createHarness();
+  await settle();
+  let comparisons = 0;
+  const roots = Array.from({ length: 40 }, () => {
+    const root = createElementWrapper();
+    root.contains = candidate => { comparisons++; return candidate === root; };
+    return root;
+  });
+  harness.getMutationCallback()([{ type: 'childList', addedNodes: roots }]);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert(roots.every(root => root.scanCount === 1));
+  assert(comparisons <= 40 * 39, 'the same batch must not repeat containment checks while enqueueing');
+});
