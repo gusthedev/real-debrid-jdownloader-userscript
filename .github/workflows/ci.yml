@@ -21,14 +21,19 @@ jobs:
           node-version: '24.19.0'
           package-manager-cache: false
       - name: Check shared-core version
-        if: github.event_name == 'pull_request'
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_MERGE_SHA: ${{ github.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CANDIDATE_SHA: ${{ github.sha }}
         run: |
-          # Checkout already has the PR merge result; fetch only its exact base.
-          git fetch --no-tags --depth=1 origin "$PR_BASE_SHA"
-          node scripts/check-shared-core-version.cjs "$PR_BASE_SHA" "$PR_MERGE_SHA" real-debrid-jdownloader.user.js
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA="$PR_BASE_SHA"
+          else
+            BASE_SHA="$PUSH_BEFORE_SHA"
+          fi
+          # Checkout has the PR merge result or pushed tip; fetch only the exact base.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          node scripts/check-shared-core-version.cjs "$BASE_SHA" "$CANDIDATE_SHA" real-debrid-jdownloader.user.js
       - name: Check syntax
         run: |
           node --check real-debrid-jdownloader.user.js
