@@ -61,6 +61,10 @@ function createElementWrapper(tagName = 'div') {
     append(...children) {
       this.children.push(...children);
     },
+    replaceChildren(...children) {
+      this.children = children;
+    },
+    focus() {},
     after(node) {
       this.nextSibling = node;
       node.previousSibling = this;
@@ -103,6 +107,7 @@ function createHarness(options = {}) {
   const alerts = [];
   const confirmations = [];
   const requests = [];
+  const popups = [];
   let mutationCallback = null;
 
   class FakeElement {
@@ -130,13 +135,22 @@ function createHarness(options = {}) {
   };
   const pageUrl = new URL('https://page.example/downloads');
   const window = {
+    open() {
+      const popup = {
+        document: { ...document, body: new FakeElement() },
+        location: { href: '' },
+        close() { this.closed = true; }
+      };
+      popups.push(popup);
+      return popup;
+    },
     alert: message => alerts.push(String(message)),
     confirm: message => {
       confirmations.push(String(message));
       return options.confirmResult !== false;
     },
     clearTimeout,
-    setTimeout
+    setTimeout: options.immediateTimers ? callback => setImmediate(callback) : setTimeout
   };
   window.self = window;
   window.top = window;
@@ -197,11 +211,201 @@ function createHarness(options = {}) {
     confirmations,
     document,
     menuCommands,
+    popups,
     requests,
     storage,
     getMutationCallback: () => mutationCallback
   };
 }
+
+function oauthSession(accessTokenIsCurrent = false) {
+  return {
+    rdOauthClientId: 'saved-client-id',
+    rdOauthClientSecret: 'saved-client-secret',
+    rdOauthAccessToken: 'saved-access-token',
+    rdOauthRefreshToken: 'saved-refresh-token',
+    rdOauthAccessTokenExpiresAt: Date.now() + (accessTokenIsCurrent ? 3_600_000 : -1000)
+  };
+}
+
+function respondJson(request, status, body) {
+  request.onload({ status, responseText: JSON.stringify(body) });
+}
+
+async function clickRealDebrid(link) {
+  const button = assertControls(link).children[0];
+  button.listeners.get('click')({ preventDefault() {}, stopPropagation() {} });
+  await settle();
+}
+
+function respondToDeviceAuthorization(request) {
+  const url = new URL(request.url);
+  if (url.pathname.endsWith('/device/code')) {
+    respondJson(request, 200, {
+      device_code: 'new-device-code', user_code: 'USERCODE',
+      verification_url: 'https://real-debrid.com/device', expires_in: 600, interval: 2
+    });
+  } else if (url.pathname.endsWith('/device/credentials')) {
+    respondJson(request, 200, { client_id: 'new-client-id', client_secret: 'new-client-secret' });
+  } else if (url.pathname.endsWith('/token')) {
+    assert.equal(new URLSearchParams(request.data).get('code'), 'new-device-code');
+    respondJson(request, 200, { access_token: 'new-access-token', refresh_token: 'new-refresh-token', expires_in: 3600 });
+  } else {
+    assert.equal(url.pathname, '/rest/1.0/unrestrict/link');
+    assert.equal(request.headers.Authorization, 'Bearer new-access-token');
+    respondJson(request, 200, { download: 'https://files.example/download' });
+  }
+}
+
+test('refresh failures retain the entire session and allow a later retry without device authorization', async t => {
+  const failures = [
+    ['network error', request => request.onerror()],
+    ['timeout', request => request.ontimeout()],
+    ...[408, 429, 500, 502, 503, 504].map(status => [
+      `HTTP ${status}`, request => respondJson(request, status, { error: 'Temporary failure', error_code: status === 429 ? 34 : 25 })
+    ]),
+    ...[408, 429, 503].map(status => [
+      `HTTP ${status} with misleading bad-token code`, request => respondJson(request, status, { error_code: 8 })
+    ]),
+    ...[400, 401, 403].map(status => [
+      `ambiguous HTTP ${status}`, request => respondJson(request, status, { error: 'Bad token' })
+    ]),
+    ['permission denied', request => respondJson(request, 403, { error: 'Permission denied', error_code: 9 })],
+    ['account locked', request => respondJson(request, 403, { error: 'Account locked', error_code: 14 })],
+    ['slow down', request => respondJson(request, 400, { error: 'Slow down', error_code: 5 })],
+    ['non-JSON response', request => request.onload({ status: 502, responseText: '<html>Bad Gateway</html>' })],
+    ['malformed success', request => request.onload({ status: 200, responseText: '{' })],
+    ['incomplete success', request => respondJson(request, 200, { access_token: 'incomplete-token' })]
+  ];
+
+  for (const accessTokenIsCurrent of [false, true]) {
+    for (const [name, fail] of failures) {
+      await t.test(`${accessTokenIsCurrent ? 'after API 401' : 'expired access token'}: ${name}`, async () => {
+        const saved = oauthSession(accessTokenIsCurrent);
+        const link = createAnchorWrapper('https://files.example/a');
+        let refreshAttempts = 0;
+        const harness = createHarness({
+          storage: saved, links: [link],
+          requestHandler(request) {
+            if (request.url.endsWith('/unrestrict/link')) {
+              if (request.headers.Authorization === 'Bearer saved-access-token') {
+                respondJson(request, 401, { error: 'Bad token', error_code: 8 });
+              } else {
+                assert.equal(request.headers.Authorization, 'Bearer refreshed-access-token');
+                respondJson(request, 200, { download: 'https://files.example/download' });
+              }
+              return;
+            }
+            assert.equal(request.url, 'https://api.real-debrid.com/oauth/v2/token');
+            const parameters = new URLSearchParams(request.data);
+            assert.equal(parameters.get('client_id'), saved.rdOauthClientId);
+            assert.equal(parameters.get('client_secret'), saved.rdOauthClientSecret);
+            assert.equal(parameters.get('code'), saved.rdOauthRefreshToken);
+            assert.equal(parameters.get('grant_type'), 'http://oauth.net/grant_type/device/1.0');
+            if (++refreshAttempts === 1) fail(request);
+            else respondJson(request, 200, { access_token: 'refreshed-access-token', expires_in: 3600 });
+          }
+        });
+        await settle();
+
+        await clickRealDebrid(link);
+        for (const [key, value] of Object.entries(saved)) assert.equal(harness.storage.get(key), value, key);
+        assert.equal(refreshAttempts, 1, 'failure must not immediately retry');
+        assert.equal(harness.popups[0].closed, true);
+        assert.match(harness.alerts.at(-1), /OAuth session could not be refreshed/);
+        assert.equal(harness.requests.some(request => request.url.includes('/device/')), false);
+
+        await clickRealDebrid(link);
+        assert.equal(refreshAttempts, 2, 'a rejected refresh promise must not block later attempts');
+        assert.equal(harness.storage.get('rdOauthClientId'), saved.rdOauthClientId);
+        assert.equal(harness.storage.get('rdOauthClientSecret'), saved.rdOauthClientSecret);
+        assert.equal(harness.storage.get('rdOauthRefreshToken'), saved.rdOauthRefreshToken);
+        assert.equal(harness.storage.get('rdOauthAccessToken'), 'refreshed-access-token');
+        assert.ok(harness.storage.get('rdOauthAccessTokenExpiresAt') > Date.now());
+        assert.equal(harness.popups[1].location.href, 'https://files.example/download');
+        assert.equal(harness.alerts.length, 1);
+      });
+    }
+  }
+});
+
+test('a definitive bad refresh token clears all OAuth values and permits device authorization', async t => {
+  for (const accessTokenIsCurrent of [false, true]) {
+    for (const status of [400, 401, 403]) {
+      for (const errorBody of [{ error: 'Bad token', error_code: 8 }, { error: 8, error_description: 'Bad token' }]) {
+        await t.test(`${accessTokenIsCurrent ? 'after API 401' : 'expired token'}: HTTP ${status}, ${JSON.stringify(errorBody)}`, async () => {
+          const saved = oauthSession(accessTokenIsCurrent);
+          const link = createAnchorWrapper('https://files.example/a');
+          let deviceRequests = 0;
+          const harness = createHarness({
+            storage: saved, links: [link], immediateTimers: true,
+            requestHandler(request) {
+              if (request.headers.Authorization === 'Bearer saved-access-token') {
+                respondJson(request, 401, { error_code: 8 });
+              } else if (new URLSearchParams(request.data).get('code') === saved.rdOauthRefreshToken) {
+                respondJson(request, status, errorBody);
+              } else {
+                if (request.url.includes('/device/code')) {
+                  deviceRequests++;
+                  for (const key of Object.keys(saved)) assert.equal(harness.storage.has(key), false, key);
+                  assert.deepEqual(harness.storage.get('rdHosts'), ['files.example']);
+                }
+                respondToDeviceAuthorization(request);
+              }
+            }
+          });
+          await settle();
+
+          await clickRealDebrid(link);
+          assert.equal(deviceRequests, 1);
+          assert.equal(harness.storage.get('rdOauthClientId'), 'new-client-id');
+          assert.equal(harness.storage.get('rdOauthClientSecret'), 'new-client-secret');
+          assert.equal(harness.storage.get('rdOauthAccessToken'), 'new-access-token');
+          assert.equal(harness.storage.get('rdOauthRefreshToken'), 'new-refresh-token');
+          assert.ok(harness.storage.get('rdOauthAccessTokenExpiresAt') > Date.now());
+          assert.equal(harness.popups[0].location.href, 'https://files.example/download');
+          assert.deepEqual(harness.alerts, []);
+        });
+      }
+    }
+  }
+});
+
+test('explicit reconnect replaces a saved session through device authorization', async () => {
+  const harness = createHarness({
+    storage: oauthSession(true), immediateTimers: true,
+    requestHandler: respondToDeviceAuthorization
+  });
+  await harness.menuCommands.get('Connect or reconnect Real-Debrid (OAuth)')();
+  assert.ok(harness.requests[0].url.includes('/device/code'));
+  assert.equal(harness.storage.get('rdOauthRefreshToken'), 'new-refresh-token');
+  assert.equal(harness.popups[0].closed, true);
+  assert.match(harness.alerts.at(-1), /connected successfully/);
+});
+
+test('explicit disconnect clears all OAuth values even when remote invalidation fails', async () => {
+  const saved = oauthSession(true);
+  const harness = createHarness({
+    storage: saved,
+    requestHandler(request) {
+      assert.equal(request.url, 'https://api.real-debrid.com/rest/1.0/disable_access_token');
+      assert.equal(request.headers.Authorization, 'Bearer saved-access-token');
+      request.onerror();
+    }
+  });
+  await harness.menuCommands.get('Disconnect Real-Debrid on this browser')();
+  for (const key of Object.keys(saved)) assert.equal(harness.storage.has(key), false, key);
+  assert.deepEqual(harness.storage.get('rdHosts'), ['files.example']);
+  assert.match(harness.alerts.at(-1), /disconnected/);
+});
+
+test('cancelling explicit disconnect preserves the session without making a request', async () => {
+  const saved = oauthSession(true);
+  const harness = createHarness({ storage: saved, confirmResult: false });
+  await harness.menuCommands.get('Disconnect Real-Debrid on this browser')();
+  for (const [key, value] of Object.entries(saved)) assert.equal(harness.storage.get(key), value, key);
+  assert.equal(harness.requests.length, 0);
+});
 
 test('public core contains only intended public hostname literals', () => {
   const literalHosts = [...new Set(
