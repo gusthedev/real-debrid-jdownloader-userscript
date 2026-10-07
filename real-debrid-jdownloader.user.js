@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.2
+// @version      7.2.3
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -404,6 +404,12 @@
     return oauthConnectionPromise;
   }
 
+  function isInvalidOAuthRefresh(error) {
+    // Real-Debrid documents numeric code 8 as "Bad token". HTTP status or
+    // human-readable text alone cannot establish that refresh rights were revoked.
+    return error instanceof RequestError && [400, 401, 403].includes(error.status) && error.apiCode === 8;
+  }
+
   function refreshOAuthAccessToken() {
     if (oauthRefreshPromise) return oauthRefreshPromise;
     const session = readOAuthSession();
@@ -418,7 +424,7 @@
     })
       .then(tokens => saveOAuthSession(session, tokens))
       .catch(error => {
-        clearOAuthSession();
+        if (isInvalidOAuthRefresh(error)) clearOAuthSession();
         throw new RequestError(`The Real-Debrid OAuth session could not be refreshed: ${error.message}`, error.status, error.apiCode);
       })
       .finally(() => { oauthRefreshPromise = null; });
@@ -432,7 +438,7 @@
       try {
         return await refreshOAuthAccessToken();
       } catch (error) {
-        if (!authorizationPopup) throw error;
+        if (!authorizationPopup || !isInvalidOAuthRefresh(error)) throw error;
       }
     }
     if (authorizationPopup) return connectOAuth(authorizationPopup);
@@ -452,7 +458,7 @@
       try {
         accessToken = await refreshOAuthAccessToken();
       } catch (refreshError) {
-        if (!authorizationPopup) throw refreshError;
+        if (!authorizationPopup || !isInvalidOAuthRefresh(refreshError)) throw refreshError;
         accessToken = await connectOAuth(authorizationPopup);
       }
       return send(accessToken);
