@@ -108,6 +108,7 @@ function createHarness(options = {}) {
   const confirmations = [];
   const requests = [];
   const popups = [];
+  const observations = [];
   let mutationCallback = null;
 
   class FakeElement {
@@ -178,7 +179,9 @@ function createHarness(options = {}) {
         mutationCallback = callback;
       }
 
-      observe() {}
+      observe(target, options) {
+        observations.push({ target, options });
+      }
     },
     console: { error() {}, info() {}, warn() {} },
     RD_JD_CONFIG: {
@@ -211,6 +214,7 @@ function createHarness(options = {}) {
     confirmations,
     document,
     menuCommands,
+    observations,
     popups,
     requests,
     storage,
@@ -231,6 +235,141 @@ function oauthSession(accessTokenIsCurrent = false) {
 function respondJson(request, status, body) {
   request.onload({ status, responseText: JSON.stringify(body) });
 }
+
+test('manual supported-host refresh reports failures while retaining cached hosts, then succeeds on retry', async t => {
+  const failures = [
+    ['network error', request => request.onerror(), /Network error/],
+    ['timeout', request => request.ontimeout(), /did not respond in time/],
+    ['HTTP 503', request => respondJson(request, 503, { error: 'Service unavailable' }), /Service unavailable/],
+    ['invalid JSON', request => request.onload({ status: 200, responseText: '{' }), /invalid response/],
+    ['empty host list', request => respondJson(request, 200, []), /empty supported-host list/]
+  ];
+
+  for (const [name, fail, message] of failures) {
+    await t.test(name, async () => {
+      const savedSession = oauthSession(true);
+      const cachedHosts = ['files.example'];
+      const cachedAt = Date.now() - 1000;
+      const existing = createAnchorWrapper('https://files.example/existing');
+      const newlySupported = createAnchorWrapper('https://new.example/existing');
+      const harness = createHarness({
+        storage: { ...savedSession, rdHosts: cachedHosts, rdHostsUpdated: cachedAt },
+        links: [existing, newlySupported], immediateTimers: true,
+        requestHandler(request) {
+          assert.equal(request.url, 'https://api.real-debrid.com/rest/1.0/hosts/domains');
+          if (harness.requests.length === 1) fail(request);
+          else respondJson(request, 200, ['files.example', 'new.example']);
+        }
+      });
+      await settle();
+      const originalControls = assertControls(existing);
+      assert.equal(harness.requests.length, 0, 'fresh cache should avoid an automatic request');
+      const refresh = harness.menuCommands.get('Refresh Real-Debrid supported hosts');
+
+      await refresh();
+      assert.equal(harness.requests.length, 1, 'manual refresh must bypass even a fresh cache');
+      assert.match(harness.alerts.at(-1), /could not be refreshed/);
+      assert.match(harness.alerts.at(-1), message);
+      assert.match(harness.alerts.at(-1), /cached list/i);
+      assert.doesNotMatch(harness.alerts.at(-1), /was refreshed/);
+      assert.equal(harness.storage.get('rdHosts'), cachedHosts);
+      assert.equal(harness.storage.get('rdHostsUpdated'), cachedAt);
+      assert.equal(existing.nextSibling, originalControls);
+      assert.equal(newlySupported.nextSibling, null);
+
+      const dynamic = createAnchorWrapper('https://files.example/dynamic');
+      harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic] }]);
+      await settle();
+      assertControls(dynamic);
+
+      await refresh();
+      assert.equal(harness.requests.length, 2);
+      assert.equal(harness.alerts.at(-1), 'The supported-host list was refreshed.');
+      assert.deepEqual(Array.from(harness.storage.get('rdHosts')), ['files.example', 'new.example']);
+      assert.ok(harness.storage.get('rdHostsUpdated') > cachedAt);
+      assertControls(newlySupported);
+      assert.equal(existing.nextSibling, originalControls, 'rescan must not duplicate controls');
+      assert.equal(harness.observations.length, 1, 'refresh must not add another observer');
+      for (const [key, value] of Object.entries(savedSession)) assert.equal(harness.storage.get(key), value, key);
+    });
+  }
+});
+
+test('automatic supported-host discovery falls back to a stale cache during an outage', async () => {
+  const cachedHosts = ['files.example'];
+  const cachedAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+  const existing = createAnchorWrapper('https://files.example/existing');
+  const harness = createHarness({
+    storage: { rdHosts: cachedHosts, rdHostsUpdated: cachedAt },
+    links: [existing], immediateTimers: true,
+    requestHandler(request) { request.onerror(); }
+  });
+  await settle();
+
+  assert.equal(harness.requests.length, 1);
+  assertControls(existing);
+  assert.equal(harness.storage.get('rdHosts'), cachedHosts);
+  assert.equal(harness.storage.get('rdHostsUpdated'), cachedAt);
+  assert.deepEqual(harness.alerts, []);
+  const dynamic = createAnchorWrapper('https://files.example/dynamic');
+  harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic] }]);
+  await settle();
+  assertControls(dynamic);
+  assert.equal(harness.observations.length, 1);
+});
+
+test('manual supported-host refresh recovers existing and dynamic links after initial discovery fails without a cache', async () => {
+  const savedSession = oauthSession(true);
+  const existing = createAnchorWrapper('https://files.example/existing');
+  let attempts = 0;
+  const harness = createHarness({
+    storage: { ...savedSession, rdHosts: [], rdHostsUpdated: 0 },
+    links: [existing], immediateTimers: true,
+    requestHandler(request) {
+      assert.equal(request.url, 'https://api.real-debrid.com/rest/1.0/hosts/domains');
+      if (++attempts <= 2) request.onerror();
+      else respondJson(request, 200, ['files.example']);
+    }
+  });
+  await settle();
+  assert.equal(attempts, 1);
+  assert.equal(existing.nextSibling, null);
+  const refresh = harness.menuCommands.get('Refresh Real-Debrid supported hosts');
+  await refresh();
+  assert.match(harness.alerts.at(-1), /could not be refreshed/);
+  assert.doesNotMatch(harness.alerts.at(-1), /cached list|was refreshed/i);
+  assert.equal(harness.storage.get('rdHostsUpdated'), 0);
+
+  const addedDuringOutage = createAnchorWrapper('https://files.example/during-outage');
+  harness.document.links.push(addedDuringOutage);
+  await refresh();
+  assert.equal(harness.alerts.at(-1), 'The supported-host list was refreshed.');
+  assertControls(existing);
+  assertControls(addedDuringOutage);
+  assert.deepEqual(Array.from(harness.storage.get('rdHosts')), ['files.example']);
+  assert.ok(harness.storage.get('rdHostsUpdated') > 0);
+  assert.equal(harness.observations.length, 1, 'recovery must leave one active observer');
+  assert.equal(harness.observations[0].target, harness.document.body);
+
+  const dynamic = createAnchorWrapper('https://files.example/dynamic');
+  const changed = createAnchorWrapper('https://unsupported.example/link');
+  harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic, changed] }]);
+  await settle();
+  assertControls(dynamic);
+  assert.equal(changed.nextSibling, null);
+  changed.setAttribute('href', 'https://files.example/changed');
+  harness.getMutationCallback()([{ type: 'attributes', attributeName: 'href', target: changed }]);
+  assertControls(changed);
+
+  const observerCallback = harness.getMutationCallback();
+  const originalControls = assertControls(existing);
+  await refresh();
+  assert.equal(attempts, 4);
+  assert.equal(harness.observations.length, 1);
+  assert.equal(harness.getMutationCallback(), observerCallback);
+  assert.equal(existing.nextSibling, originalControls);
+  for (const [key, value] of Object.entries(savedSession)) assert.equal(harness.storage.get(key), value, key);
+});
 
 async function clickRealDebrid(link) {
   const button = assertControls(link).children[0];
