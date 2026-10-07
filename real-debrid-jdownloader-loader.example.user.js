@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader Loader
 // @namespace    local.real-debrid.jdownloader.loader
-// @version      1.1.0
+// @version      1.1.2
 // @description  Loads the shared Real-Debrid/JDownloader script with private local configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -39,7 +39,7 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
-// @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @connect      api.real-debrid.com
 // @connect      jdownloader.example.com
 // @run-at       document-idle
@@ -55,7 +55,8 @@
     excludedDomains: ['example.com']
   });
 
-  const SHARED_SCRIPT_URL = 'https://raw.githubusercontent.com/gusthedev/real-debrid-jdownloader-userscript/main/real-debrid-jdownloader.user.js';
+  // Resolve main through the Contents API instead of the raw-content edge cache.
+  const SHARED_SCRIPT_URL = 'https://api.github.com/repos/gusthedev/real-debrid-jdownloader-userscript/contents/real-debrid-jdownloader.user.js?ref=main';
   const UPDATE_INTERVAL = 60 * 60 * 1000;
   const EMPTY_CACHE_RETRY_INTERVAL = 5 * 60 * 1000;
   const REQUEST_TIMEOUT = 15_000;
@@ -69,13 +70,21 @@
   let updateInFlight = false;
 
   function sharedCoreVersion(source) {
-    return String(source || '').match(/^\/\/\s*@version\s+([^\s]+)\s*$/m)?.[1] || 'unknown version';
+    const header = String(source || '').match(/^\/\/ ==UserScript==\r?\n([\s\S]*?)^\/\/ ==\/UserScript==[ \t]*\r?$/m)?.[1] || '';
+    const versions = [...header.matchAll(/^\/\/[ \t]*@version[ \t]+([^\r\n]*)/gm)];
+    const value = versions[0]?.[1].trim() || '';
+    // Match the semantic-version contract enforced by the exact-base PR guard.
+    const number = '(?:0|[1-9][0-9]*)';
+    const prerelease = '(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)';
+    const semver = new RegExp(`^${number}\\.${number}\\.${number}(?:-${prerelease}(?:\\.${prerelease})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`);
+    return versions.length === 1 && semver.test(value) ? value : '';
   }
 
   function isValidSharedCore(source) {
     if (typeof source !== 'string' || source.length < 1_000 || source.length > 500_000) return false;
     if (!source.includes('// @name         Real-Debrid OAuth + JDownloader (Shared Core)')) return false;
     if (!source.includes('// @namespace    shared.real-debrid.jdownloader')) return false;
+    if (!sharedCoreVersion(source)) return false;
     if (!source.includes('globalThis.RD_JD_CONFIG')) return false;
 
     try {
@@ -97,8 +106,9 @@
     return '';
   }
 
+  // Callers validate source when reading the cache or receiving an update.
   function executeSharedCore(source) {
-    if (executionAttempted || !isValidSharedCore(source)) return false;
+    if (executionAttempted) return false;
     executionAttempted = true;
     try {
       eval(`${source}\n//# sourceURL=real-debrid-jdownloader.user.js`);
@@ -134,7 +144,15 @@
 
     const previousSource = readCachedSource();
     const etag = previousSource ? GM_getValue(STORAGE.etag, '') : '';
-    const headers = etag ? { 'If-None-Match': etag } : {};
+    const headers = {
+      Accept: 'application/vnd.github.raw+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(etag ? { 'If-None-Match': etag } : {})
+    };
+    if (manual) {
+      headers['Cache-Control'] = 'no-cache';
+      headers.Pragma = 'no-cache';
+    }
 
     function fail(message, error) {
       updateInFlight = false;
@@ -145,7 +163,7 @@
 
     GM_xmlhttpRequest({
       method: 'GET',
-      url: SHARED_SCRIPT_URL,
+      url: manual ? `${SHARED_SCRIPT_URL}&tm_refresh=${Date.now()}` : SHARED_SCRIPT_URL,
       headers,
       timeout: REQUEST_TIMEOUT,
       onload(response) {
