@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.4
+// @version      7.2.5
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -75,7 +75,8 @@
     oauthClientSecret: 'rdOauthClientSecret',
     accessToken: 'rdOauthAccessToken',
     refreshToken: 'rdOauthRefreshToken',
-    accessTokenExpiresAt: 'rdOauthAccessTokenExpiresAt'
+    accessTokenExpiresAt: 'rdOauthAccessTokenExpiresAt',
+    oauthGeneration: 'rdOauthSessionGeneration'
   });
 
   const OAUTH_STORAGE_KEYS = [
@@ -111,6 +112,7 @@
   let processTimer = null;
   let oauthConnectionPromise = null;
   let oauthRefreshPromise = null;
+  let oauthSessionGeneration = '';
   const pendingRoots = new Set();
   const injectedControls = new WeakMap();
 
@@ -253,6 +255,24 @@
     OAUTH_STORAGE_KEYS.forEach(key => GM_deleteValue(key));
   }
 
+  function currentOAuthGeneration() {
+    const generation = String(GM_getValue(STORAGE.oauthGeneration, '') || '');
+    if (generation !== oauthSessionGeneration) {
+      oauthSessionGeneration = generation;
+      oauthConnectionPromise = null;
+      oauthRefreshPromise = null;
+    }
+    return generation;
+  }
+
+  function assertCurrentOAuthOperation(generation, session = null) {
+    const current = session ? readOAuthSession() : null;
+    if (generation !== currentOAuthGeneration()
+        || (session && Object.keys(session).some(key => session[key] !== current[key]))) {
+      throw new RequestError('The Real-Debrid operation was cancelled because the OAuth session changed. Try again to reconnect.');
+    }
+  }
+
   function saveOAuthSession(credentials, tokens) {
     const accessToken = String(tokens?.access_token || '');
     const refreshToken = String(tokens?.refresh_token || GM_getValue(STORAGE.refreshToken, '') || '');
@@ -344,7 +364,7 @@
     }
   }
 
-  async function pollForOAuthCredentials(authorization) {
+  async function pollForOAuthCredentials(authorization, generation) {
     const deviceCode = String(authorization.device_code || '');
     const expiresIn = Number(authorization.expires_in) || 0;
     let interval = Math.max(Number(authorization.interval) || 5, 2) * 1000;
@@ -357,6 +377,7 @@
 
     while (Date.now() < deadline) {
       await delay(interval);
+      assertCurrentOAuthOperation(generation);
       try {
         const credentials = await requestJson(
           `${RD_OAUTH_BASE}/device/credentials?${new URLSearchParams({
@@ -364,10 +385,12 @@
             code: deviceCode
           })}`
         );
+        assertCurrentOAuthOperation(generation);
         if (credentials?.client_id && credentials?.client_secret) {
           return { clientId: String(credentials.client_id), clientSecret: String(credentials.client_secret) };
         }
       } catch (error) {
+        assertCurrentOAuthOperation(generation);
         if (error.status === 429) {
           interval += 5000;
           continue;
@@ -380,28 +403,40 @@
     throw new RequestError('Real-Debrid authorization expired before it was completed.');
   }
 
-  async function runOAuthConnection(popup) {
+  async function runOAuthConnection(popup, generation) {
     const authorization = await requestJson(
       `${RD_OAUTH_BASE}/device/code?${new URLSearchParams({
         client_id: RD_PUBLIC_CLIENT_ID,
         new_credentials: 'yes'
       })}`
     );
+    assertCurrentOAuthOperation(generation);
     renderOAuthInstructions(popup, authorization);
-    const credentials = await pollForOAuthCredentials(authorization);
+    const credentials = await pollForOAuthCredentials(authorization, generation);
+    assertCurrentOAuthOperation(generation);
     const tokens = await postOAuthToken({
       client_id: credentials.clientId,
       client_secret: credentials.clientSecret,
       code: String(authorization.device_code),
       grant_type: RD_DEVICE_GRANT
     });
+    assertCurrentOAuthOperation(generation);
     return saveOAuthSession(credentials, tokens);
   }
 
   function connectOAuth(popup) {
+    const generation = currentOAuthGeneration();
     if (oauthConnectionPromise) return oauthConnectionPromise;
-    oauthConnectionPromise = runOAuthConnection(popup).finally(() => { oauthConnectionPromise = null; });
-    return oauthConnectionPromise;
+    const connection = runOAuthConnection(popup, generation)
+      .catch(error => {
+        assertCurrentOAuthOperation(generation);
+        throw error;
+      })
+      .finally(() => {
+        if (oauthConnectionPromise === connection) oauthConnectionPromise = null;
+      });
+    oauthConnectionPromise = connection;
+    return connection;
   }
 
   function isInvalidOAuthRefresh(error) {
@@ -411,33 +446,43 @@
   }
 
   function refreshOAuthAccessToken() {
+    const generation = currentOAuthGeneration();
     if (oauthRefreshPromise) return oauthRefreshPromise;
     const session = readOAuthSession();
     if (!session.clientId || !session.clientSecret || !session.refreshToken) {
       return Promise.reject(new RequestError('Real-Debrid is not connected.'));
     }
-    oauthRefreshPromise = postOAuthToken({
+    const refresh = postOAuthToken({
       client_id: session.clientId,
       client_secret: session.clientSecret,
       code: session.refreshToken,
       grant_type: RD_DEVICE_GRANT
     })
-      .then(tokens => saveOAuthSession(session, tokens))
+      .then(tokens => {
+        assertCurrentOAuthOperation(generation, session);
+        return saveOAuthSession(session, tokens);
+      })
       .catch(error => {
+        assertCurrentOAuthOperation(generation, session);
         if (isInvalidOAuthRefresh(error)) clearOAuthSession();
         throw new RequestError(`The Real-Debrid OAuth session could not be refreshed: ${error.message}`, error.status, error.apiCode);
       })
-      .finally(() => { oauthRefreshPromise = null; });
-    return oauthRefreshPromise;
+      .finally(() => {
+        if (oauthRefreshPromise === refresh) oauthRefreshPromise = null;
+      });
+    oauthRefreshPromise = refresh;
+    return refresh;
   }
 
   async function getValidAccessToken(authorizationPopup = null) {
+    const generation = currentOAuthGeneration();
     const session = readOAuthSession();
     if (session.accessToken && Date.now() < session.expiresAt - TOKEN_EXPIRY_MARGIN) return session.accessToken;
     if (session.clientId && session.clientSecret && session.refreshToken) {
       try {
         return await refreshOAuthAccessToken();
       } catch (error) {
+        assertCurrentOAuthOperation(generation);
         if (!authorizationPopup || !isInvalidOAuthRefresh(error)) throw error;
       }
     }
@@ -446,18 +491,26 @@
   }
 
   async function requestRealDebrid(url, options = {}, authorizationPopup = null) {
+    const generation = currentOAuthGeneration();
     let accessToken = await getValidAccessToken(authorizationPopup);
-    const send = token => requestJson(url, {
-      ...options,
-      headers: { ...options.headers, Authorization: `Bearer ${token}` }
-    });
+    const send = async token => {
+      assertCurrentOAuthOperation(generation);
+      const response = await requestJson(url, {
+        ...options,
+        headers: { ...options.headers, Authorization: `Bearer ${token}` }
+      });
+      assertCurrentOAuthOperation(generation);
+      return response;
+    };
     try {
       return await send(accessToken);
     } catch (error) {
+      assertCurrentOAuthOperation(generation);
       if (error.status !== 401 && error.apiCode !== 8) throw error;
       try {
         accessToken = await refreshOAuthAccessToken();
       } catch (refreshError) {
+        assertCurrentOAuthOperation(generation);
         if (!authorizationPopup || !isInvalidOAuthRefresh(refreshError)) throw refreshError;
         accessToken = await connectOAuth(authorizationPopup);
       }
@@ -467,16 +520,22 @@
 
   async function disconnectOAuth() {
     const { accessToken } = readOAuthSession();
+    // Retire pending work before any remote I/O. Old completions must not save
+    // credentials, clear a newer session, or release a newer in-flight promise.
+    // This non-secret marker survives credential deletion and is shared by tabs
+    // using this loader. Randomness distinguishes simultaneous disconnects; it
+    // is not an authentication token and does not need cryptographic strength.
+    GM_setValue(STORAGE.oauthGeneration, `${Date.now()}:${Math.random()}`);
+    currentOAuthGeneration();
+    clearOAuthSession();
     try {
       if (accessToken) {
         await requestJson(`${RD_API_BASE}/disable_access_token`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
       }
-    } catch (error) {
-      console.warn('[RD + JD] Could not disable the current access token remotely.', error);
-    } finally {
-      clearOAuthSession();
+    } catch {
+      console.warn('[RD + JD] Could not disable the previous access token remotely. Local OAuth credentials were cleared.');
     }
   }
 
@@ -822,8 +881,10 @@
         return;
       }
       preparePopup(popup, 'Preparing Real-Debrid authorization…');
+      const generation = currentOAuthGeneration();
       try {
         await connectOAuth(popup);
+        assertCurrentOAuthOperation(generation);
         try { popup.close(); } catch { /* Nothing to close. */ }
         window.alert('Real-Debrid OAuth was connected successfully.');
       } catch (error) {
@@ -833,8 +894,9 @@
     });
     GM_registerMenuCommand('Disconnect Real-Debrid on this browser', async () => {
       if (!window.confirm('Disconnect Real-Debrid and clear this browser’s saved OAuth session?')) return;
-      await disconnectOAuth();
+      const disconnect = disconnectOAuth();
       window.alert('Real-Debrid was disconnected on this browser.');
+      await disconnect;
     });
     GM_registerMenuCommand('Refresh Real-Debrid supported hosts', async () => {
       try {

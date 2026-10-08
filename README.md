@@ -37,6 +37,14 @@ Tampermonkey stores the supported-host cache and the Real-Debrid OAuth client ID
 
 The status command reports only whether the OAuth fields exist and when the access token expires. It never displays their values. Its JDownloader check submits the normal form fields with an empty `urls` value, so it does not add a download; it accepts either documented Flash-interface result as proof that the interface itself is reachable.
 
+## OAuth disconnect and recovery
+
+Shared core **7.2.5** clears local OAuth credentials immediately when you confirm **Disconnect Real-Debrid on this browser**, then attempts to invalidate the previous access token remotely. A failed remote request does not restore local credentials. A new connection can start while that request is still pending.
+
+Pending refresh and device-authorization operations check whether they were superseded before saving credentials, continuing authorization, or reporting success. A non-secret `rdOauthSessionGeneration` marker remains in Tampermonkey storage after disconnect so other tabs using the same loader can detect the disconnect too. Old request cleanup cannot release a newer operation's shared promise, and a refresh for replaced credentials cannot overwrite or clear the newer session.
+
+Transient refresh failures still retain the saved credentials for a later retry. Only a definitive invalid-token response for the current session clears them and permits device authorization. To connect again after an explicit disconnect, use the connect menu or retry a Real-Debrid link. Reload open pages after updating the core so every tab uses the new guards.
+
 ## Checks
 
 Run the dependency-free Node test suite with:
