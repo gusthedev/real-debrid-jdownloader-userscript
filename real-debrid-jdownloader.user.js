@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.3
+// @version      7.2.4
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -499,7 +499,8 @@
       GM_setValue(STORAGE.hosts, freshHosts);
       GM_setValue(STORAGE.hostsUpdated, Date.now());
     } catch (error) {
-      if (!cachedHosts.length) throw error;
+      // A manual refresh must report the API failure even when cached hosts remain usable.
+      if (forceRefresh || !cachedHosts.length) throw error;
       console.warn('[RD + JD] Could not refresh supported hosts; using the cached list.', error);
     }
   }
@@ -841,7 +842,8 @@
         rescanAllLinks();
         window.alert('The supported-host list was refreshed.');
       } catch (error) {
-        window.alert(`The supported-host list could not be refreshed.\n\n${error.message}`);
+        const fallback = supportedDomains.size ? '\nThe cached list is still in use.' : '';
+        window.alert(`The supported-host list could not be refreshed.${fallback}\n\n${error.message}`);
       }
     });
     GM_registerMenuCommand('Send all supported page links to JDownloader', () => {
@@ -856,9 +858,10 @@
     registerMenuCommands();
     if (!document.body) return;
     try {
+      // Keep observing through discovery outages so a later refresh can recover.
+      startObserver();
       await loadSupportedHosts();
       rescanAllLinks();
-      startObserver();
     } catch (error) {
       console.error('[RD + JD] Initialization failed.', error);
     }
