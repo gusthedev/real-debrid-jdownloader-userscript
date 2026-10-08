@@ -98,7 +98,7 @@ function assertControls(link) {
 
 function createHarness(options = {}) {
   const now = Date.now();
-  const storage = new Map(Object.entries({
+  const storage = options.sharedStorage || new Map(Object.entries({
     rdHosts: ['files.example'],
     rdHostsUpdated: now,
     ...options.storage
@@ -109,6 +109,7 @@ function createHarness(options = {}) {
   const requests = [];
   const popups = [];
   const observations = [];
+  const logs = [];
   let mutationCallback = null;
 
   class FakeElement {
@@ -151,7 +152,7 @@ function createHarness(options = {}) {
       return options.confirmResult !== false;
     },
     clearTimeout,
-    setTimeout: options.immediateTimers ? callback => setImmediate(callback) : setTimeout
+    setTimeout: options.setTimeout || (options.immediateTimers ? callback => setImmediate(callback) : setTimeout)
   };
   window.self = window;
   window.top = window;
@@ -183,7 +184,7 @@ function createHarness(options = {}) {
         observations.push({ target, options });
       }
     },
-    console: { error() {}, info() {}, warn() {} },
+    console: Object.fromEntries(['error', 'info', 'warn'].map(level => [level, (...args) => logs.push(args.map(String))])),
     RD_JD_CONFIG: {
       jdownloaderEndpoint: 'https://jdownloader.example.com/flash/add',
       excludedDomains: []
@@ -214,6 +215,7 @@ function createHarness(options = {}) {
     confirmations,
     document,
     menuCommands,
+    logs,
     observations,
     popups,
     requests,
@@ -544,6 +546,251 @@ test('cancelling explicit disconnect preserves the session without making a requ
   await harness.menuCommands.get('Disconnect Real-Debrid on this browser')();
   for (const [key, value] of Object.entries(saved)) assert.equal(harness.storage.get(key), value, key);
   assert.equal(harness.requests.length, 0);
+});
+
+const connectCommand = 'Connect or reconnect Real-Debrid (OAuth)';
+const disconnectCommand = 'Disconnect Real-Debrid on this browser';
+
+function assertDisconnected(harness) {
+  for (const key of Object.keys(oauthSession())) assert.equal(harness.storage.has(key), false, key);
+  assert.deepEqual(harness.storage.get('rdHosts'), ['files.example']);
+}
+
+async function pendingRequest(harness, suffix, index = 0) {
+  await settle();
+  const request = harness.requests.filter(item => new URL(item.url).pathname.endsWith(suffix))[index];
+  assert.ok(request, `expected ${suffix} request ${index + 1}`);
+  return request;
+}
+
+async function finishAuthorization(harness, codeIndex = 0, credentialsIndex = 0, tokenIndex = 0) {
+  respondToDeviceAuthorization(await pendingRequest(harness, '/device/code', codeIndex));
+  respondToDeviceAuthorization(await pendingRequest(harness, '/device/credentials', credentialsIndex));
+  respondToDeviceAuthorization(await pendingRequest(harness, '/token', tokenIndex));
+}
+
+test('disconnect prevents a shared pending refresh from restoring credentials or unlocking links', async () => {
+  const links = [createAnchorWrapper('https://files.example/a'), createAnchorWrapper('https://files.example/b')];
+  const harness = createHarness({ storage: oauthSession(), links, requestHandler() {} });
+  await settle();
+  await Promise.all(links.map(clickRealDebrid));
+  const refresh = await pendingRequest(harness, '/token');
+  assert.equal(harness.requests.length, 1, 'overlapping callers share one refresh');
+
+  const disconnect = harness.menuCommands.get(disconnectCommand)();
+  respondJson(await pendingRequest(harness, '/disable_access_token'), 204, null);
+  await disconnect;
+  assertDisconnected(harness);
+  respondJson(refresh, 200, { access_token: 'late-access-token', refresh_token: 'late-refresh-token', expires_in: 3600 });
+  await settle();
+  assertDisconnected(harness);
+  assert.equal(harness.requests.length, 2, 'no downstream API calls or automatic authorization');
+  assert.ok(harness.popups.every(popup => popup.closed && !popup.location.href));
+  assert.equal(harness.alerts.filter(message => /cancelled/.test(message)).length, 2);
+});
+
+test('disconnect clears immediately and late remote invalidation cannot erase a reconnection', async t => {
+  for (const fails of [false, true]) {
+    await t.test(fails ? 'remote failure' : 'remote success', async () => {
+      const harness = createHarness({ storage: oauthSession(true), immediateTimers: true, requestHandler() {} });
+      const disconnect = harness.menuCommands.get(disconnectCommand)();
+      const invalidation = await pendingRequest(harness, '/disable_access_token');
+      assertDisconnected(harness);
+      assert.equal(invalidation.headers.Authorization, 'Bearer saved-access-token');
+
+      const reconnect = harness.menuCommands.get(connectCommand)();
+      await finishAuthorization(harness);
+      await reconnect;
+      const reconnected = new Map(harness.storage);
+      if (fails) respondJson(invalidation, 503, { error: 'saved-access-token saved-client-secret' });
+      else respondJson(invalidation, 204, null);
+      await disconnect;
+      assert.deepEqual(harness.storage, reconnected);
+      assert.match(harness.alerts.at(-1), /connected successfully/, 'old disconnect must not report over a new connection');
+      assert.doesNotMatch(JSON.stringify([harness.alerts, harness.logs]), /saved-access-token|saved-client-secret/);
+    });
+  }
+});
+
+test('disconnect cancels every pending device-authorization stage and allows a fresh connection', async t => {
+  for (const stage of ['/device/code', '/device/credentials', '/token']) {
+    await t.test(stage, async () => {
+      const harness = createHarness({ immediateTimers: true, requestHandler() {} });
+      const connection = harness.menuCommands.get(connectCommand)();
+      if (stage !== '/device/code') respondToDeviceAuthorization(await pendingRequest(harness, '/device/code'));
+      if (stage === '/token') respondToDeviceAuthorization(await pendingRequest(harness, '/device/credentials'));
+      const pending = await pendingRequest(harness, stage);
+      await harness.menuCommands.get(disconnectCommand)();
+      const count = harness.requests.length;
+      respondToDeviceAuthorization(pending);
+      await settle();
+      assert.equal(harness.requests.length, count, 'cancelled authorization must not advance to another request');
+      await connection;
+      assertDisconnected(harness);
+      assert.equal(harness.popups[0].closed, true);
+      assert.ok(harness.alerts.every(message => !message.includes('connected successfully')));
+      assert.match(harness.alerts.at(-1), /cancelled/);
+
+      const reconnect = harness.menuCommands.get(connectCommand)();
+      await finishAuthorization(harness, 1, stage === '/device/code' ? 0 : 1, stage === '/token' ? 1 : 0);
+      await reconnect;
+      assert.equal(harness.storage.get('rdOauthAccessToken'), 'new-access-token');
+      assert.match(harness.alerts.at(-1), /connected successfully/);
+    });
+  }
+});
+
+test('disconnect during the authorization polling delay prevents another poll', async () => {
+  const timers = [];
+  const harness = createHarness({ setTimeout: callback => timers.push(callback), requestHandler() {} });
+  const connection = harness.menuCommands.get(connectCommand)();
+  respondToDeviceAuthorization(await pendingRequest(harness, '/device/code'));
+  await settle();
+  assert.equal(timers.length, 1);
+  await harness.menuCommands.get(disconnectCommand)();
+  timers.shift()();
+  await settle();
+  assert.equal(harness.requests.length, 1);
+  await connection;
+  assertDisconnected(harness);
+  assert.match(harness.alerts.at(-1), /cancelled/);
+});
+
+test('a late cancelled authorization cannot release the newer connection promise', async () => {
+  const harness = createHarness({ immediateTimers: true, requestHandler() {} });
+  const oldConnection = harness.menuCommands.get(connectCommand)();
+  respondToDeviceAuthorization(await pendingRequest(harness, '/device/code'));
+  respondToDeviceAuthorization(await pendingRequest(harness, '/device/credentials'));
+  const oldToken = await pendingRequest(harness, '/token');
+  await harness.menuCommands.get(disconnectCommand)();
+  const newConnection = harness.menuCommands.get(connectCommand)();
+  await pendingRequest(harness, '/device/code', 1);
+  respondToDeviceAuthorization(oldToken);
+  await oldConnection;
+  assertDisconnected(harness);
+  const sharedConnection = harness.menuCommands.get(connectCommand)();
+  await settle();
+  assert.equal(harness.requests.filter(request => request.url.includes('/device/code')).length, 2);
+  await finishAuthorization(harness, 1, 1, 1);
+  await Promise.all([newConnection, sharedConnection]);
+  assert.equal(harness.storage.get('rdOauthAccessToken'), 'new-access-token');
+  assert.equal(harness.alerts.filter(message => message.includes('connected successfully')).length, 2);
+});
+
+test('late refresh outcomes cannot mutate a reconnected session or release its pending refresh', async t => {
+  const outcomes = [
+    ['success', request => respondJson(request, 200, { access_token: 'stale-token', refresh_token: 'stale-refresh', expires_in: 3600 })],
+    ['bad token', request => respondJson(request, 401, { error_code: 8, error: 'stale-refresh' })],
+    ['network error', request => request.onerror()]
+  ];
+  for (const [name, complete] of outcomes) {
+    await t.test(name, async () => {
+      const links = ['a', 'b', 'c'].map(name => createAnchorWrapper(`https://files.example/${name}`));
+      const harness = createHarness({ storage: oauthSession(), links, immediateTimers: true, requestHandler() {} });
+      await settle();
+      await clickRealDebrid(links[0]);
+      const oldRefresh = await pendingRequest(harness, '/token');
+      const disconnect = harness.menuCommands.get(disconnectCommand)();
+      respondJson(await pendingRequest(harness, '/disable_access_token'), 204, null);
+      await disconnect;
+      const reconnect = harness.menuCommands.get(connectCommand)();
+      await finishAuthorization(harness, 0, 0, 1);
+      await reconnect;
+      harness.storage.set('rdOauthAccessTokenExpiresAt', 0);
+      await clickRealDebrid(links[1]);
+      const newRefresh = await pendingRequest(harness, '/token', 2);
+      assert.equal(new URLSearchParams(newRefresh.data).get('code'), 'new-refresh-token');
+      const saved = new Map(harness.storage);
+      complete(oldRefresh);
+      await settle();
+      assert.deepEqual(harness.storage, saved);
+      await clickRealDebrid(links[2]);
+      assert.equal(harness.requests.filter(request => request.url.endsWith('/token')).length, 3);
+      respondJson(newRefresh, 200, { access_token: 'current-token', expires_in: 3600 });
+      await settle();
+      const unlocks = harness.requests.filter(request => request.url.endsWith('/unrestrict/link'));
+      assert.equal(unlocks.length, 2);
+      for (const request of unlocks) {
+        assert.equal(request.headers.Authorization, 'Bearer current-token');
+        respondJson(request, 200, { download: 'https://files.example/download' });
+      }
+      await settle();
+      assert.equal(harness.storage.get('rdOauthRefreshToken'), 'new-refresh-token');
+      assert.equal(harness.storage.get('rdOauthAccessToken'), 'current-token');
+      assert.doesNotMatch(JSON.stringify([harness.alerts, harness.logs]), /stale-refresh|current-token|new-refresh-token/);
+    });
+  }
+});
+
+test('an API response arriving after disconnect cannot trigger refresh, authorization, or download success', async t => {
+  for (const status of [200, 401]) {
+    await t.test(`HTTP ${status}`, async () => {
+      const link = createAnchorWrapper('https://files.example/a');
+      const harness = createHarness({ storage: oauthSession(true), links: [link], requestHandler() {} });
+      await settle();
+      await clickRealDebrid(link);
+      const api = await pendingRequest(harness, '/unrestrict/link');
+      const disconnect = harness.menuCommands.get(disconnectCommand)();
+      respondJson(await pendingRequest(harness, '/disable_access_token'), 204, null);
+      await disconnect;
+      respondJson(api, status, status === 200 ? { download: 'https://files.example/download' } : { error_code: 8 });
+      await settle();
+      assert.equal(harness.requests.length, 2);
+      assertDisconnected(harness);
+      assert.equal(harness.popups[0].closed, true);
+      assert.equal(harness.popups[0].location.href, '');
+      assert.match(harness.alerts.at(-1), /cancelled/);
+    });
+  }
+});
+
+test('disconnect in another tab supersedes pending authorization and permits a new connection', async () => {
+  const first = createHarness({ immediateTimers: true, requestHandler() {} });
+  const second = createHarness({ sharedStorage: first.storage, immediateTimers: true, requestHandler() {} });
+  const oldConnection = first.menuCommands.get(connectCommand)();
+  respondToDeviceAuthorization(await pendingRequest(first, '/device/code'));
+  respondToDeviceAuthorization(await pendingRequest(first, '/device/credentials'));
+  const oldToken = await pendingRequest(first, '/token');
+  await second.menuCommands.get(disconnectCommand)();
+
+  // Starting again in the first tab must stop sharing its obsolete promise,
+  // even though that tab did not execute the disconnect command itself.
+  const reconnect = first.menuCommands.get(connectCommand)();
+  await finishAuthorization(first, 1, 1, 1);
+  await reconnect;
+  const saved = new Map(first.storage);
+  respondJson(oldToken, 200, { access_token: 'late-token', refresh_token: 'late-refresh', expires_in: 3600 });
+  await oldConnection;
+  assert.deepEqual(first.storage, saved);
+  assert.equal(first.alerts.filter(message => message.includes('connected successfully')).length, 1);
+  assert.match(first.alerts.at(-1), /cancelled/);
+});
+
+test('overlapping refreshes in different tabs cannot overwrite or invalidate a newer session', async t => {
+  for (const invalid of [false, true]) {
+    await t.test(invalid ? 'late bad-token response' : 'late success', async () => {
+      const firstLink = createAnchorWrapper('https://files.example/a');
+      const secondLink = createAnchorWrapper('https://files.example/b');
+      const first = createHarness({ storage: oauthSession(), links: [firstLink], requestHandler() {} });
+      const second = createHarness({ sharedStorage: first.storage, links: [secondLink], requestHandler() {} });
+      await settle();
+      await Promise.all([clickRealDebrid(firstLink), clickRealDebrid(secondLink)]);
+      respondJson(await pendingRequest(first, '/token'), 200, {
+        access_token: 'current-token', refresh_token: 'current-refresh', expires_in: 3600
+      });
+      await settle();
+      const saved = new Map(first.storage);
+      const late = await pendingRequest(second, '/token');
+      if (invalid) respondJson(late, 401, { error_code: 8 });
+      else respondJson(late, 200, { access_token: 'stale-token', refresh_token: 'stale-refresh', expires_in: 3600 });
+      await settle();
+      assert.deepEqual(first.storage, saved);
+      assert.equal(second.requests.length, 1, 'a superseded refresh must not fall back to authorization');
+      assert.match(second.alerts.at(-1), /cancelled/);
+      respondJson(await pendingRequest(first, '/unrestrict/link'), 200, { download: 'https://files.example/download' });
+      await settle();
+    });
+  }
 });
 
 test('public core contains only intended public hostname literals', () => {
