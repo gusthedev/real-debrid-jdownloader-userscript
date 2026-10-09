@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.5
+// @version      7.2.6
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -114,6 +114,7 @@
   let oauthRefreshPromise = null;
   let oauthSessionGeneration = '';
   const pendingRoots = new Set();
+  const pendingRemovedLinks = new Set();
   const injectedControls = new WeakMap();
 
   class RequestError extends Error {
@@ -799,11 +800,15 @@
   }
 
   function processLink(link) {
-    if (!isAnchorNode(link) || !link.hasAttribute('href')) return;
+    if (!isAnchorNode(link)) return;
     const currentUrl = link.href;
     const existing = injectedControls.get(link);
-    const supported = isSupportedUrl(currentUrl);
-    if (existing?.url === currentUrl && link.nextSibling === existing.container && supported) return;
+    const supported = link.isConnected && link.hasAttribute('href') && isSupportedUrl(currentUrl);
+    if (existing?.url === currentUrl && supported) {
+      // Keep the same buttons (including in-flight state) when an anchor moves.
+      if (link.nextSibling !== existing.container) link.after(existing.container);
+      return;
+    }
     if (existing) {
       existing.container.remove();
       injectedControls.delete(link);
@@ -837,6 +842,10 @@
 
   function flushPendingRoots() {
     processTimer = null;
+    const removedLinks = [...pendingRemovedLinks];
+    pendingRemovedLinks.clear();
+    // A removal may be a move or a temporary detach; use the final DOM state.
+    removedLinks.forEach(processLink);
     const roots = [...pendingRoots].filter(root => root.isConnected);
     pendingRoots.clear();
     roots
@@ -850,6 +859,20 @@
     if (processTimer === null) processTimer = window.setTimeout(flushPendingRoots, 150);
   }
 
+  function scheduleRemovedRoot(root) {
+    if (!isElementNode(root) || root.matches('[data-rd-jd-controls]')) return;
+    const collect = link => {
+      if (injectedControls.has(link)) pendingRemovedLinks.add(link);
+    };
+    // Snapshot anchors now: detached subtrees can change before the batch runs.
+    // Include anchors whose href was removed in the same mutation burst.
+    collect(root);
+    root.querySelectorAll('a').forEach(collect);
+    if (pendingRemovedLinks.size && processTimer === null) {
+      processTimer = window.setTimeout(flushPendingRoots, 150);
+    }
+  }
+
   function startObserver() {
     const observer = new MutationObserver(mutations => {
       for (const mutation of mutations) {
@@ -858,6 +881,7 @@
           continue;
         }
         mutation.addedNodes.forEach(scheduleRoot);
+        mutation.removedNodes.forEach(scheduleRemovedRoot);
       }
     });
     observer.observe(document.body, {

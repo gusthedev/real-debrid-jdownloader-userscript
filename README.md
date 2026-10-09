@@ -39,11 +39,15 @@ The status command reports only whether the OAuth fields exist and when the acce
 
 ## OAuth disconnect and recovery
 
-Shared core **7.2.5** clears local OAuth credentials immediately when you confirm **Disconnect Real-Debrid on this browser**, then attempts to invalidate the previous access token remotely. A failed remote request does not restore local credentials. A new connection can start while that request is still pending.
+Shared core **7.2.6** clears local OAuth credentials immediately when you confirm **Disconnect Real-Debrid on this browser**, then attempts to invalidate the previous access token remotely. A failed remote request does not restore local credentials. A new connection can start while that request is still pending.
 
 Pending refresh and device-authorization operations check whether they were superseded before saving credentials, continuing authorization, or reporting success. A non-secret `rdOauthSessionGeneration` marker remains in Tampermonkey storage after disconnect so other tabs using the same loader can detect the disconnect too. Old request cleanup cannot release a newer operation's shared promise, and a refresh for replaced credentials cannot overwrite or clear the newer session.
 
 Transient refresh failures still retain the saved credentials for a later retry. Only a definitive invalid-token response for the current session clears them and permits device authorization. To connect again after an explicit disconnect, use the connect menu or retry a Real-Debrid link. Reload open pages after updating the core so every tab uses the new guards.
+
+## Dynamic page controls
+
+Removed anchors and their injected buttons are reconciled in the existing 150 ms mutation batch, without a full-page rescan. Controls follow moved anchors and retain in-flight button state. Links reinserted before the batch runs keep their controls; links reinserted after cleanup receive fresh controls. Removing an entire subtree or a link's `href` also clears the affected controls.
 
 ## Checks
 
