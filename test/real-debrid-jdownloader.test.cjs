@@ -31,7 +31,13 @@ function createElementWrapper(tagName = 'div') {
     dataset: {},
     style: {},
     listeners: new Map(),
+    parentNode: null,
+    previousSibling: null,
     nextSibling: null,
+    setConnected(connected) {
+      this.isConnected = connected;
+      this.children.forEach(child => child.setConnected(connected));
+    },
     contains(candidate) {
       return candidate === this || this.children.some(child => child.contains(candidate));
     },
@@ -42,7 +48,12 @@ function createElementWrapper(tagName = 'div') {
       this.attributes.set(name, String(value));
       if (name === 'href') this.href = String(value);
     },
+    removeAttribute(name) {
+      this.attributes.delete(name);
+      if (name === 'href') this.href = '';
+    },
     matches(selector) {
+      if (selector === 'a') return this.tagName === 'A';
       if (selector === 'a[href]') return this.tagName === 'A' && this.hasAttribute('href');
       if (selector === '[data-rd-jd-controls]') return this.dataset.rdJdControls !== undefined;
       return false;
@@ -59,19 +70,45 @@ function createElementWrapper(tagName = 'div') {
       this.listeners.set(type, listener);
     },
     append(...children) {
-      this.children.push(...children);
+      for (const child of children) {
+        child.remove();
+        child.removed = false;
+        child.parentNode = this;
+        child.previousSibling = this.children.at(-1) || null;
+        if (child.previousSibling) child.previousSibling.nextSibling = child;
+        child.setConnected(this.isConnected);
+        this.children.push(child);
+      }
     },
     replaceChildren(...children) {
-      this.children = children;
+      [...this.children].forEach(child => child.remove());
+      this.append(...children);
     },
     focus() {},
     after(node) {
+      node.remove();
+      node.removed = false;
+      node.parentNode = this.parentNode;
+      if (this.parentNode) {
+        const siblings = this.parentNode.children;
+        siblings.splice(siblings.indexOf(this) + 1, 0, node);
+      }
+      node.nextSibling = this.nextSibling;
+      if (node.nextSibling) node.nextSibling.previousSibling = node;
       this.nextSibling = node;
       node.previousSibling = this;
+      node.setConnected(this.isConnected);
     },
     remove() {
       this.removed = true;
-      if (this.previousSibling) this.previousSibling.nextSibling = null;
+      if (this.parentNode) {
+        const siblings = this.parentNode.children;
+        siblings.splice(siblings.indexOf(this), 1);
+      }
+      if (this.previousSibling) this.previousSibling.nextSibling = this.nextSibling;
+      if (this.nextSibling) this.nextSibling.previousSibling = this.previousSibling;
+      this.parentNode = this.previousSibling = this.nextSibling = null;
+      this.setConnected(false);
     }
   };
 }
@@ -128,10 +165,12 @@ function createHarness(options = {}) {
   const document = {
     body: new FakeElement(),
     links: options.links || [],
+    scanCount: 0,
     createElement(tagName) {
       return tagName === 'a' ? new FakeAnchor() : new FakeElement(tagName);
     },
     querySelectorAll() {
+      this.scanCount += 1;
       return this.links;
     }
   };
@@ -280,7 +319,7 @@ test('manual supported-host refresh reports failures while retaining cached host
       assert.equal(newlySupported.nextSibling, null);
 
       const dynamic = createAnchorWrapper('https://files.example/dynamic');
-      harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic] }]);
+      harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [dynamic] }]);
       await settle();
       assertControls(dynamic);
 
@@ -314,7 +353,7 @@ test('automatic supported-host discovery falls back to a stale cache during an o
   assert.equal(harness.storage.get('rdHostsUpdated'), cachedAt);
   assert.deepEqual(harness.alerts, []);
   const dynamic = createAnchorWrapper('https://files.example/dynamic');
-  harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic] }]);
+  harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [dynamic] }]);
   await settle();
   assertControls(dynamic);
   assert.equal(harness.observations.length, 1);
@@ -355,7 +394,7 @@ test('manual supported-host refresh recovers existing and dynamic links after in
 
   const dynamic = createAnchorWrapper('https://files.example/dynamic');
   const changed = createAnchorWrapper('https://unsupported.example/link');
-  harness.getMutationCallback()([{ type: 'childList', addedNodes: [dynamic, changed] }]);
+  harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [dynamic, changed] }]);
   await settle();
   assertControls(dynamic);
   assert.equal(changed.nextSibling, null);
@@ -921,7 +960,7 @@ test('mutation batching prunes a pending child when its parent is also pending',
   const parent = new harness.FakeElement();
   parent.children.push(child);
 
-  harness.getMutationCallback()([{ type: 'childList', addedNodes: [child, parent] }]);
+  harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [child, parent] }]);
   await new Promise(resolve => setTimeout(resolve, 180));
 
   assert.equal(parent.scanCount, 1);
@@ -976,6 +1015,7 @@ test('mutation-added wrapped roots process anchors and skip non-elements and inj
 
   harness.getMutationCallback()([{
     type: 'childList',
+    removedNodes: [],
     addedNodes: [direct, nested, root, injected, disconnected, ...nonElements, null, {}, { nodeType: 1 }]
   }]);
   await new Promise(resolve => setTimeout(resolve, 180));
@@ -989,7 +1029,7 @@ test('mutation-added wrapped roots process anchors and skip non-elements and inj
   assert.equal(disconnected.nextSibling, null);
   nonElements.forEach(node => assert.equal(node.scanCount, 0));
 
-  harness.getMutationCallback()([{ type: 'childList', addedNodes: [direct, directControls] }]);
+  harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [direct, directControls] }]);
   await new Promise(resolve => setTimeout(resolve, 180));
   assert.equal(direct.nextSibling, directControls, 'rescanning must not duplicate controls');
   assert.equal(directControls.scanCount, 0);
@@ -1040,8 +1080,235 @@ test('a burst of sibling roots is deduplicated once before scanning', async () =
     root.contains = candidate => { comparisons++; return candidate === root; };
     return root;
   });
-  harness.getMutationCallback()([{ type: 'childList', addedNodes: roots }]);
+  harness.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: roots }]);
   await new Promise(resolve => setTimeout(resolve, 180));
   assert(roots.every(root => root.scanCount === 1));
   assert(comparisons <= 40 * 39, 'the same batch must not repeat containment checks while enqueueing');
+});
+
+// Drive the existing 150 ms batch deterministically, without wall-clock sleeps.
+async function createMutationHarness() {
+  const timers = [];
+  const link = createAnchorWrapper('https://files.example/original');
+  const parent = createElementWrapper();
+  parent.append(link);
+  const harness = createHarness({
+    links: [link],
+    setTimeout: (callback, milliseconds) => { timers.push({ callback, milliseconds }); },
+    requestHandler() {}
+  });
+  harness.document.body.append(parent);
+  await settle();
+  return {
+    ...harness, link, parent, timers,
+    childList(addedNodes = [], removedNodes = []) {
+      harness.getMutationCallback()([{ type: 'childList', addedNodes, removedNodes }]);
+    },
+    flush() {
+      const timer = timers.shift();
+      if (!timer) return;
+      assert.equal(timer.milliseconds, 150);
+      timer.callback();
+    }
+  };
+}
+
+test('removing an anchor cleans its surviving sibling controls without a page rescan', async () => {
+  const h = await createMutationHarness();
+  const controls = assertControls(h.link);
+  const scans = h.document.scanCount;
+
+  h.link.remove();
+  assert.equal(controls.isConnected, true, 'the orphaned controls remain on the page');
+  assert.deepEqual(h.parent.children, [controls]);
+  h.childList([], [h.link]);
+  h.flush();
+
+  assert.equal(controls.isConnected, false);
+  assert.deepEqual(h.parent.children, []);
+  assert.equal(h.document.scanCount, scans);
+  assert.equal(h.requests.length, 0);
+});
+
+test('moving an anchor reuses its active controls and preserves request completion', async () => {
+  const h = await createMutationHarness();
+  const controls = assertControls(h.link);
+  const button = controls.children[1];
+  button.listeners.get('click')({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, '⏳');
+  assert.equal(h.requests.length, 1);
+
+  const destination = createElementWrapper();
+  h.document.body.append(destination);
+  destination.append(h.link);
+  h.childList([h.link], [h.link]);
+  h.flush();
+
+  assert.equal(h.link.nextSibling, controls);
+  assert.equal(controls.children[1], button);
+  assert.deepEqual(h.parent.children, []);
+  assert.deepEqual(destination.children, [h.link, controls]);
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, '⏳');
+
+  h.requests[0].onload({ status: 200, responseText: 'success', finalUrl: h.requests[0].url });
+  await settle();
+  assert.equal(button.textContent, '✅');
+  assert.equal(h.timers.length, 1);
+  assert.equal(h.timers[0].milliseconds, 1800);
+  h.timers.shift().callback();
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, '📥');
+});
+
+test('reinserting an anchor before cleanup preserves its controls across observer deliveries', async t => {
+  for (const reinsertBeforeDelivery of [true, false]) {
+    await t.test(reinsertBeforeDelivery ? 'before delivery' : 'after delivery, before flush', async () => {
+      const h = await createMutationHarness();
+      const controls = assertControls(h.link);
+      h.link.remove();
+      if (reinsertBeforeDelivery) h.parent.append(h.link);
+      h.childList([], [h.link]);
+      if (!reinsertBeforeDelivery) h.parent.append(h.link);
+      h.childList([h.link]);
+      assert.equal(h.timers.length, 1, 'removals and additions share one batch');
+      h.flush();
+      assert.equal(h.link.nextSibling, controls);
+      assert.deepEqual(h.parent.children, [h.link, controls]);
+      assert.equal(controls.removed, false);
+    });
+  }
+});
+
+test('removal and later reinsertion repeatedly create exactly one fresh pair of controls', async () => {
+  const h = await createMutationHarness();
+  const scans = h.document.scanCount;
+  for (let iteration = 0; iteration < 3; iteration++) {
+    const previous = assertControls(h.link);
+    h.link.remove();
+    h.childList([], [h.link, h.link]);
+    h.childList([], [h.link]);
+    assert.equal(h.timers.length, 1);
+    h.flush();
+    assert.equal(previous.isConnected, false);
+    assert.deepEqual(h.parent.children, []);
+    // Removing our own controls must not cause another cleanup batch.
+    h.childList([], [previous]);
+    assert.equal(h.timers.length, 0);
+
+    h.parent.append(h.link);
+    h.childList([h.link, h.link]);
+    h.flush();
+    const current = assertControls(h.link);
+    assert.notEqual(current, previous);
+    assert.deepEqual(h.parent.children, [h.link, current]);
+  }
+  assert.equal(h.document.scanCount, scans);
+});
+
+test('moving a whole subtree preserves adjacent controls without duplicates', async () => {
+  const h = await createMutationHarness();
+  const controls = assertControls(h.link);
+  const destination = createElementWrapper();
+  h.document.body.append(destination);
+  destination.append(h.parent);
+  h.childList([h.parent], [h.parent]);
+  h.flush();
+  assert.equal(h.link.nextSibling, controls);
+  assert.equal(controls.removed, false);
+  assert.deepEqual(h.parent.children, [h.link, controls]);
+});
+
+test('subtree removal snapshots tracked anchors even without href or later ancestry', async () => {
+  const h = await createMutationHarness();
+  const controls = assertControls(h.link);
+  const nestedRoot = createElementWrapper();
+  const nested = createAnchorWrapper('https://files.example/nested');
+  nestedRoot.append(nested);
+  h.parent.append(nestedRoot);
+  h.childList([nestedRoot]);
+  h.flush();
+  const nestedControls = assertControls(nested);
+  const scans = h.document.scanCount;
+
+  h.parent.remove();
+  h.link.removeAttribute('href');
+  h.childList([], [h.parent]);
+  // Changes after removal delivery are no longer observed on the detached tree.
+  h.link.remove();
+  nestedRoot.remove();
+  h.flush();
+  assert.equal(controls.removed, true);
+  assert.equal(nestedControls.removed, true);
+  assert.equal(h.link.nextSibling, null);
+  assert.equal(nested.nextSibling, null);
+  assert.equal(h.document.scanCount, scans);
+
+  h.parent.append(nestedRoot);
+  h.document.body.append(h.parent);
+  h.childList([h.parent]);
+  h.flush();
+  assert.notEqual(assertControls(nested), nestedControls);
+  assert.deepEqual(nestedRoot.children, [nested, nested.nextSibling]);
+});
+
+test('pending removal uses current URL and controls after href changes', async () => {
+  const h = await createMutationHarness();
+  const original = assertControls(h.link);
+  h.link.remove();
+  h.childList([], [h.link]);
+  h.parent.append(h.link);
+  h.link.setAttribute('href', 'https://files.example/changed');
+  h.getMutationCallback()([{ type: 'attributes', attributeName: 'href', target: h.link }]);
+  const replacement = assertControls(h.link);
+  assert.notEqual(replacement, original);
+  assert.equal(original.removed, true);
+  h.childList([h.link]);
+  h.flush();
+  assert.equal(h.link.nextSibling, replacement, 'old cleanup must not remove current controls');
+  replacement.children[1].listeners.get('click')({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(new URLSearchParams(h.requests[0].data).get('urls'), h.link.href);
+
+  h.link.remove();
+  h.childList([], [h.link]);
+  h.link.setAttribute('href', 'https://unsupported.example/changed');
+  h.parent.append(h.link);
+  h.childList([h.link]);
+  h.flush();
+  assert.equal(replacement.removed, true);
+  assert.equal(h.link.nextSibling, null);
+});
+
+test('href removal cleans controls and detached href changes cannot inject new controls', async () => {
+  const h = await createMutationHarness();
+  const original = assertControls(h.link);
+  const mutateHref = () => h.getMutationCallback()([{
+    type: 'attributes', attributeName: 'href', target: h.link
+  }]);
+  h.link.removeAttribute('href');
+  mutateHref();
+  assert.equal(original.removed, true);
+  assert.equal(h.link.nextSibling, null);
+
+  h.link.remove();
+  h.link.setAttribute('href', 'https://files.example/new');
+  mutateHref();
+  assert.equal(h.link.nextSibling, null);
+  h.parent.append(h.link);
+  h.childList([h.link]);
+  h.flush();
+  assertControls(h.link);
+});
+
+test('removal cleanup ignores untracked nodes, text, and injected controls', async () => {
+  const h = await createMutationHarness();
+  const controls = assertControls(h.link);
+  const unrelated = createElementWrapper();
+  unrelated.append(createAnchorWrapper('https://unsupported.example/no-controls'));
+  h.childList([], [unrelated, controls, { nodeType: 3 }, null, {}, { nodeType: 1 }]);
+  assert.equal(h.timers.length, 0);
+  assert.equal(controls.scanCount, 0);
+  assert.equal(h.link.nextSibling, controls);
+  assert.equal(controls.isConnected, true);
 });
