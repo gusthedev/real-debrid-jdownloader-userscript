@@ -147,6 +147,7 @@ function createHarness(options = {}) {
   const popups = [];
   const observations = [];
   const logs = [];
+  const storageWrites = [];
   let mutationCallback = null;
 
   class FakeElement {
@@ -232,6 +233,7 @@ function createHarness(options = {}) {
       return storage.has(key) ? storage.get(key) : defaultValue;
     },
     GM_setValue(key, value) {
+      storageWrites.push({ key, value });
       storage.set(key, value);
     },
     GM_deleteValue(key) {
@@ -259,6 +261,7 @@ function createHarness(options = {}) {
     popups,
     requests,
     storage,
+    storageWrites,
     getMutationCallback: () => mutationCallback
   };
 }
@@ -277,16 +280,236 @@ function respondJson(request, status, body) {
   request.onload({ status, responseText: JSON.stringify(body) });
 }
 
-test('manual supported-host refresh reports failures while retaining cached hosts, then succeeds on retry', async t => {
-  const failures = [
-    ['network error', request => request.onerror(), /Network error/],
-    ['timeout', request => request.ontimeout(), /did not respond in time/],
-    ['HTTP 503', request => respondJson(request, 503, { error: 'Service unavailable' }), /Service unavailable/],
-    ['invalid JSON', request => request.onload({ status: 200, responseText: '{' }), /invalid response/],
-    ['empty host list', request => respondJson(request, 200, []), /empty supported-host list/]
-  ];
+const supportedHostFailures = [
+  ['network error', request => request.onerror(), /Network error/],
+  ['timeout', request => request.ontimeout(), /did not respond in time/],
+  ['HTTP 503', request => respondJson(request, 503, { error: 'Service unavailable' }), /Service unavailable/],
+  ['invalid JSON', request => request.onload({ status: 200, responseText: '{' }), /invalid response/],
+  ['empty host list', request => respondJson(request, 200, []), /empty supported-host list/]
+];
 
-  for (const [name, fail, message] of failures) {
+test('overlapping startup discovery and manual refresh keep the latest requested hosts', async t => {
+  for (const withCache of [false, true]) {
+    for (const manualFirst of [false, true]) {
+      await t.test(`${withCache ? 'stale cache' : 'no cache'}, ${manualFirst ? 'manual' : 'startup'} responds first`, async () => {
+        const oldLink = createAnchorWrapper('https://old.example/file');
+        const newLink = createAnchorWrapper('https://new.example/file');
+        const h = createHarness({
+          storage: { rdHosts: withCache ? ['cached.example'] : [], rdHostsUpdated: 0 },
+          links: [oldLink, newLink], requestHandler() {}
+        });
+        assert.equal(h.requests.length, 1);
+        const manual = h.menuCommands.get('Refresh Real-Debrid supported hosts')();
+        assert.equal(h.requests.length, 2);
+        h.requests.forEach(request => assert.equal(request.url, 'https://api.real-debrid.com/rest/1.0/hosts/domains'));
+
+        const startupResponse = () => respondJson(h.requests[0], 200, ['old.example']);
+        const manualResponse = () => respondJson(h.requests[1], 200, ['new.example']);
+        (manualFirst ? manualResponse : startupResponse)();
+        await settle();
+        if (!manualFirst) {
+          assert.equal(h.storageWrites.length, 0, 'superseded startup must not publish while manual refresh is pending');
+          assert.equal(oldLink.nextSibling, null);
+          assert.deepEqual(h.alerts, []);
+        }
+        (manualFirst ? startupResponse : manualResponse)();
+        await manual;
+        await settle();
+
+        assert.deepEqual(Array.from(h.storage.get('rdHosts')), ['new.example']);
+        assert.equal(h.storageWrites.length, 2, 'only the authoritative response writes hosts and timestamp');
+        assert.equal(h.storageWrites[1].key, 'rdHostsUpdated');
+        assert.ok(h.storage.get('rdHostsUpdated') > 0);
+        assert.equal(oldLink.nextSibling, null);
+        assertControls(newLink);
+        assert.deepEqual(h.alerts, ['The supported-host list was refreshed.']);
+        assert.equal(h.observations.length, 1);
+        assert.equal(h.requests.length, 2);
+      });
+    }
+  }
+});
+
+test('consecutive manual supported-host refreshes reconcile controls using only the newest response', async t => {
+  for (const newestFirst of [false, true]) {
+    await t.test(newestFirst ? 'newest responds first' : 'oldest responds first', async () => {
+      const savedSession = oauthSession(true);
+      const removed = createAnchorWrapper('https://files.example/existing');
+      const retained = createAnchorWrapper('https://keep.example/existing');
+      const added = createAnchorWrapper('https://new.example/existing');
+      const obsolete = createAnchorWrapper('https://old.example/existing');
+      const timers = [];
+      const h = createHarness({
+        storage: { ...savedSession, rdHosts: ['files.example', 'keep.example'] },
+        links: [removed, retained, added, obsolete], requestHandler() {},
+        setTimeout(callback, milliseconds) { timers.push({ callback, milliseconds }); }
+      });
+      await settle();
+      const removedControls = assertControls(removed);
+      const retainedControls = assertControls(retained);
+      const refresh = h.menuCommands.get('Refresh Real-Debrid supported hosts');
+      const first = refresh();
+      const second = refresh();
+      assert.equal(h.requests.length, 2);
+      const oldResponse = () => respondJson(h.requests[0], 200, ['old.example']);
+      const newResponse = () => respondJson(h.requests[1], 200, ['new.example', 'keep.example']);
+      (newestFirst ? newResponse : oldResponse)();
+      await settle();
+      if (!newestFirst) {
+        assert.deepEqual(h.alerts, [], 'an ignored success must not claim that hosts were refreshed');
+        assert.equal(h.storageWrites.length, 0);
+        assert.equal(removed.nextSibling, removedControls);
+      }
+      (newestFirst ? oldResponse : newResponse)();
+      await Promise.all([first, second]);
+      const addedControls = assertControls(added);
+      assert.equal(removed.nextSibling, null);
+      assert.equal(removedControls.removed, true);
+      assert.equal(obsolete.nextSibling, null);
+      assert.equal(retained.nextSibling, retainedControls);
+      assert.deepEqual(Array.from(h.storage.get('rdHosts')), ['new.example', 'keep.example']);
+      assert.equal(h.storageWrites.length, 2);
+      assert.deepEqual(h.alerts, ['The supported-host list was refreshed.']);
+
+      // A later independent refresh still works after both overlapping calls settle.
+      const third = refresh();
+      assert.equal(h.requests.length, 3);
+      respondJson(h.requests[2], 200, ['new.example', 'keep.example']);
+      await third;
+      assert.equal(added.nextSibling, addedControls, 'unchanged controls must be reused');
+      assert.equal(retained.nextSibling, retainedControls);
+      assert.equal(h.storageWrites.length, 4);
+
+      const newDynamic = createAnchorWrapper('https://new.example/dynamic');
+      const oldDynamic = createAnchorWrapper('https://files.example/dynamic');
+      h.getMutationCallback()([{ type: 'childList', removedNodes: [], addedNodes: [newDynamic, oldDynamic] }]);
+      assert.equal(timers.length, 1);
+      assert.equal(timers[0].milliseconds, 150);
+      timers.shift().callback();
+      assertControls(newDynamic);
+      assert.equal(oldDynamic.nextSibling, null);
+      oldDynamic.setAttribute('href', 'https://new.example/changed');
+      h.getMutationCallback()([{ type: 'attributes', attributeName: 'href', target: oldDynamic }]);
+      assertControls(oldDynamic);
+      assert.equal(h.observations.length, 1);
+      assert.equal(timers.length, 0, 'host discovery must not install a polling timer');
+      for (const [key, value] of Object.entries(savedSession)) assert.equal(h.storage.get(key), value, key);
+    });
+  }
+});
+
+test('superseded supported-host failures cannot disturb a newer successful manual refresh', async t => {
+  for (const automatic of [true, false]) {
+    for (const [name, fail] of supportedHostFailures) {
+      await t.test(`${automatic ? 'startup' : 'manual'} ${name}`, async () => {
+        const link = createAnchorWrapper('https://new.example/file');
+        const h = createHarness({
+          storage: { rdHosts: ['cached.example'], rdHostsUpdated: automatic ? 0 : Date.now() },
+          links: [link], requestHandler() {}
+        });
+        await settle();
+        const refresh = h.menuCommands.get('Refresh Real-Debrid supported hosts');
+        const stale = automatic ? null : refresh();
+        const current = refresh();
+        assert.equal(h.requests.length, 2);
+        respondJson(h.requests[1], 200, ['new.example']);
+        await current;
+        const hosts = h.storage.get('rdHosts');
+        const updated = h.storage.get('rdHostsUpdated');
+        const controls = assertControls(link);
+        fail(h.requests[0]);
+        await stale;
+        await settle();
+        assert.equal(h.storage.get('rdHosts'), hosts);
+        assert.equal(h.storage.get('rdHostsUpdated'), updated);
+        assert.equal(h.storageWrites.length, 2);
+        assert.equal(link.nextSibling, controls);
+        assert.deepEqual(h.alerts, ['The supported-host list was refreshed.']);
+        assert.deepEqual(h.logs, [], 'obsolete failures should not report a current discovery outage');
+        assert.equal(h.requests.length, 2);
+      });
+    }
+  }
+});
+
+test('a failed newest supported-host refresh retains the accepted cache without reviving older responses', async t => {
+  for (const withCache of [false, true]) {
+    for (const failureFirst of [false, true]) {
+      await t.test(`${withCache ? 'stale cache' : 'no cache'}, ${failureFirst ? 'failure' : 'stale success'} first`, async () => {
+        const cachedHosts = withCache ? ['cached.example'] : [];
+        const cached = createAnchorWrapper('https://cached.example/file');
+        const old = createAnchorWrapper('https://old.example/file');
+        const current = createAnchorWrapper('https://new.example/file');
+        const h = createHarness({
+          storage: { rdHosts: cachedHosts, rdHostsUpdated: 0 },
+          links: [cached, old, current], requestHandler() {}
+        });
+        const refresh = h.menuCommands.get('Refresh Real-Debrid supported hosts');
+        const manual = refresh();
+        const fail = () => h.requests[1].onerror();
+        const succeed = () => respondJson(h.requests[0], 200, ['old.example']);
+        (failureFirst ? fail : succeed)();
+        await settle();
+        (failureFirst ? succeed : fail)();
+        await manual;
+        await settle();
+        assert.equal(h.storage.get('rdHosts'), cachedHosts);
+        assert.equal(h.storage.get('rdHostsUpdated'), 0);
+        assert.equal(h.storageWrites.length, 0);
+        assert.equal(old.nextSibling, null);
+        if (withCache) assertControls(cached);
+        else assert.equal(cached.nextSibling, null);
+        assert.equal(h.alerts.length, 1);
+        assert.match(h.alerts[0], /could not be refreshed.*\n[\s\S]*Network error/);
+        assert.equal(/cached list/.test(h.alerts[0]), withCache);
+        assert.doesNotMatch(h.alerts[0], /was refreshed/);
+
+        const retry = refresh();
+        assert.equal(h.requests.length, 3);
+        respondJson(h.requests[2], 200, ['new.example']);
+        await retry;
+        assertControls(current);
+        assert.equal(cached.nextSibling, null);
+        assert.deepEqual(Array.from(h.storage.get('rdHosts')), ['new.example']);
+        assert.equal(h.alerts.at(-1), 'The supported-host list was refreshed.');
+      });
+    }
+  }
+});
+
+test('automatic supported-host callers share pending discovery and stale cleanup preserves the newer request', async t => {
+  for (const staleFails of [false, true]) {
+    await t.test(staleFails ? 'stale failure' : 'stale success', async () => {
+      const h = createHarness({
+        storage: { rdHosts: [], rdHostsUpdated: 0 }, confirmResult: false,
+        links: [createAnchorWrapper('https://new.example/file')], requestHandler() {}
+      });
+      const sendAll = h.menuCommands.get('Send all supported page links to JDownloader');
+      sendAll();
+      await settle();
+      assert.equal(h.requests.length, 1, 'bulk send should share startup discovery');
+      const manual = h.menuCommands.get('Refresh Real-Debrid supported hosts')();
+      assert.equal(h.requests.length, 2, 'explicit refresh must start a newer request');
+      if (staleFails) h.requests[0].onerror();
+      else respondJson(h.requests[0], 200, ['old.example']);
+      await settle();
+      sendAll();
+      await settle();
+      assert.equal(h.requests.length, 2, 'stale completion must not release the newer shared request');
+      respondJson(h.requests[1], 200, ['new.example']);
+      await manual;
+      await settle();
+      assert.equal(h.storageWrites.length, 2, 'shared callers should publish the list only once');
+      assert.deepEqual(Array.from(h.storage.get('rdHosts')), ['new.example']);
+      sendAll();
+      await settle();
+      assert.equal(h.requests.length, 2, 'fresh cache should avoid another automatic request');
+    });
+  }
+});
+
+test('manual supported-host refresh reports failures while retaining cached hosts, then succeeds on retry', async t => {
+  for (const [name, fail, message] of supportedHostFailures) {
     await t.test(name, async () => {
       const savedSession = oauthSession(true);
       const cachedHosts = ['files.example'];

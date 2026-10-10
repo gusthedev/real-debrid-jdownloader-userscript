@@ -39,11 +39,17 @@ The status command reports only whether the OAuth fields exist and when the acce
 
 ## OAuth disconnect and recovery
 
-Shared core **7.2.6** clears local OAuth credentials immediately when you confirm **Disconnect Real-Debrid on this browser**, then attempts to invalidate the previous access token remotely. A failed remote request does not restore local credentials. A new connection can start while that request is still pending.
+Shared core **7.2.7** clears local OAuth credentials immediately when you confirm **Disconnect Real-Debrid on this browser**, then attempts to invalidate the previous access token remotely. A failed remote request does not restore local credentials. A new connection can start while that request is still pending.
 
 Pending refresh and device-authorization operations check whether they were superseded before saving credentials, continuing authorization, or reporting success. A non-secret `rdOauthSessionGeneration` marker remains in Tampermonkey storage after disconnect so other tabs using the same loader can detect the disconnect too. Old request cleanup cannot release a newer operation's shared promise, and a refresh for replaced credentials cannot overwrite or clear the newer session.
 
 Transient refresh failures still retain the saved credentials for a later retry. Only a definitive invalid-token response for the current session clears them and permits device authorization. To connect again after an explicit disconnect, use the connect menu or retry a Real-Debrid link. Reload open pages after updating the core so every tab uses the new guards.
+
+## Supported-host refreshes
+
+Within each running page, the newest requested supported-host refresh is authoritative. **Refresh Real-Debrid supported hosts** bypasses the cache and supersedes any pending discovery or earlier manual refresh. Superseded responses cannot replace the in-memory list, stored hosts, or cache timestamp, and their successes or failures do not produce refresh notifications. If the newest request fails, the last accepted cache remains in use and the manual command reports the failure; an older pending response cannot revive itself afterward.
+
+Automatic discovery and bulk-send operations use a fresh cache when available and otherwise share the current in-flight host request. This adds no polling or retry requests. A successful manual refresh reconciles existing controls with the accepted host list, and the existing observer continues handling added or changed links. The guard is local to the page; it does not coordinate refresh ordering across separate tabs.
 
 ## Dynamic page controls
 
