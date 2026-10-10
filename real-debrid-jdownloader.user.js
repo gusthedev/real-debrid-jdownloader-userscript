@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.6
+// @version      7.2.7
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -109,6 +109,8 @@
   }
 
   let supportedDomains = new Set();
+  let supportedHostsGeneration = 0;
+  let supportedHostsRequest = null;
   let processTimer = null;
   let oauthConnectionPromise = null;
   let oauthRefreshPromise = null;
@@ -550,18 +552,33 @@
     const lastUpdated = Number(GM_getValue(STORAGE.hostsUpdated, 0)) || 0;
     const cacheIsFresh = Date.now() - lastUpdated < HOST_CACHE_MAX_AGE;
     if (cachedHosts.length) supportedDomains = new Set(cachedHosts);
-    if (!forceRefresh && cacheIsFresh && cachedHosts.length) return;
+    if (!forceRefresh && cacheIsFresh && cachedHosts.length) return true;
+    // Automatic callers share discovery; each explicit refresh supersedes it.
+    if (forceRefresh || !supportedHostsRequest) {
+      const generation = ++supportedHostsGeneration;
+      const promise = requestJson(`${RD_API_BASE}/hosts/domains`).then(response => {
+        if (generation !== supportedHostsGeneration) return false;
+        const freshHosts = normalizeHostList(response);
+        if (!freshHosts.length) throw new RequestError('Real-Debrid returned an empty supported-host list.');
+        supportedDomains = new Set(freshHosts);
+        GM_setValue(STORAGE.hosts, freshHosts);
+        GM_setValue(STORAGE.hostsUpdated, Date.now());
+        return true;
+      });
+      supportedHostsRequest = { generation, promise };
+    }
+    const request = supportedHostsRequest;
     try {
-      const response = await requestJson(`${RD_API_BASE}/hosts/domains`);
-      const freshHosts = normalizeHostList(response);
-      if (!freshHosts.length) throw new RequestError('Real-Debrid returned an empty supported-host list.');
-      supportedDomains = new Set(freshHosts);
-      GM_setValue(STORAGE.hosts, freshHosts);
-      GM_setValue(STORAGE.hostsUpdated, Date.now());
+      return await request.promise;
     } catch (error) {
+      if (request.generation !== supportedHostsGeneration) return false;
       // A manual refresh must report the API failure even when cached hosts remain usable.
-      if (forceRefresh || !cachedHosts.length) throw error;
+      if (forceRefresh || !supportedDomains.size) throw error;
       console.warn('[RD + JD] Could not refresh supported hosts; using the cached list.', error);
+      return true;
+    } finally {
+      // An older request must not release a newer in-flight discovery.
+      if (supportedHostsRequest === request) supportedHostsRequest = null;
     }
   }
 
@@ -924,7 +941,7 @@
     });
     GM_registerMenuCommand('Refresh Real-Debrid supported hosts', async () => {
       try {
-        await loadSupportedHosts(true);
+        if (!await loadSupportedHosts(true)) return;
         rescanAllLinks();
         window.alert('The supported-host list was refreshed.');
       } catch (error) {
