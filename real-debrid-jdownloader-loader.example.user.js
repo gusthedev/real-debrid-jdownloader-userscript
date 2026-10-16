@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader Loader
 // @namespace    local.real-debrid.jdownloader.loader
-// @version      1.1.2
+// @version      1.1.3
 // @description  Loads the shared Real-Debrid/JDownloader script with private local configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -36,6 +36,7 @@
 // @exclude      *://*.youtube.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand

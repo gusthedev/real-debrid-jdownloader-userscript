@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Real-Debrid OAuth + JDownloader (Shared Core)
 // @namespace    shared.real-debrid.jdownloader
-// @version      7.2.7
+// @version      7.3.0
 // @description  Adds Real-Debrid OAuth and verified JDownloader controls beside supported host links using loader-provided configuration.
 // @match        *://*/*
 // @exclude      *://mdblist.com/*
@@ -12,6 +12,7 @@
 // @exclude      *://*.soundcloud.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
@@ -69,6 +70,7 @@
   }
 
   const STORAGE = Object.freeze({
+    hostsState: 'rdSupportedHostsStateV1',
     hosts: 'rdHosts',
     hostsUpdated: 'rdHostsUpdated',
     oauthClientId: 'rdOauthClientId',
@@ -109,7 +111,7 @@
   }
 
   let supportedDomains = new Set();
-  let supportedHostsGeneration = 0;
+  let supportedHostsState = null;
   let supportedHostsRequest = null;
   let processTimer = null;
   let oauthConnectionPromise = null;
@@ -547,22 +549,104 @@
     return [...new Set(value.map(normalizeHostname).filter(Boolean))];
   }
 
+  // A request stamp is a logical clock plus a per-request tie breaker. Incrementing
+  // the observed clock orders same-millisecond refreshes and survives clock rollback.
+  function compareHostStamps(left, right) {
+    if (!left || !right) return left ? 1 : right ? -1 : 0;
+    return left.clock - right.clock || (left.id > right.id ? 1 : left.id < right.id ? -1 : 0);
+  }
+
+  function validHostStamp(stamp) {
+    return stamp && Number.isSafeInteger(stamp.clock) && stamp.clock > 0
+      && typeof stamp.id === 'string' && stamp.id.length > 0;
+  }
+
+  function readHostState(value) {
+    if (!value || !validHostStamp(value.requested)
+      || (value.accepted !== null && !validHostStamp(value.accepted))
+      || compareHostStamps(value.accepted, value.requested) > 0
+      || !Array.isArray(value.hosts) || !Number.isFinite(value.updatedAt) || value.updatedAt < 0) return null;
+    const hosts = normalizeHostList(value.hosts);
+    if (value.accepted && (!hosts.length || !value.updatedAt)) return null;
+    return { requested: value.requested, accepted: value.accepted, hosts, updatedAt: value.updatedAt };
+  }
+
+  function mergeHostStates(left, right) {
+    if (!left || !right) return left || right;
+    // A new request carries its last accepted cache as fallback. Results from a
+    // superseded request cannot revive after failure, even via delayed events.
+    const order = compareHostStamps(left.requested, right.requested);
+    if (order !== 0) return order > 0 ? left : right;
+    return compareHostStamps(left.accepted, right.accepted) >= 0 ? left : right;
+  }
+
+  function applyHostState(state) {
+    supportedHostsState = state;
+    const changed = supportedDomains.size !== state.hosts.length
+      || state.hosts.some(host => !supportedDomains.has(host));
+    supportedDomains = new Set(state.hosts);
+    if (changed && document.body) rescanAllLinks();
+  }
+
+  function syncSupportedHosts(incoming = null) {
+    const stored = readHostState(GM_getValue(STORAGE.hostsState, null));
+    const state = mergeHostStates(mergeHostStates(supportedHostsState, stored), readHostState(incoming));
+    if (state) {
+      applyHostState(state);
+      // GM storage has no compare-and-swap. Merge delayed/concurrent events and
+      // repair a losing write, rather than treating notification order as authority.
+      if (state.requested && (!stored
+        || compareHostStamps(state.requested, stored.requested) !== 0
+        || compareHostStamps(state.accepted, stored.accepted) !== 0)) {
+        GM_setValue(STORAGE.hostsState, state);
+      }
+      return state;
+    }
+    // Import old installations lazily. Once a versioned record exists, old tabs
+    // writing legacy keys cannot overwrite it. Never write split cache values.
+    const legacy = {
+      requested: null, accepted: null,
+      hosts: normalizeHostList(GM_getValue(STORAGE.hosts, [])),
+      updatedAt: Number(GM_getValue(STORAGE.hostsUpdated, 0)) || 0
+    };
+    applyHostState(legacy);
+    return legacy;
+  }
+
+  function publishHostState(state) {
+    applyHostState(state);
+    GM_setValue(STORAGE.hostsState, state);
+  }
+
+  function startSupportedHostsSync() {
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(STORAGE.hostsState, (_key, _oldValue, newValue, remote) => {
+        if (remote) syncSupportedHosts(newValue);
+      });
+    } else {
+      console.warn('[RD + JD] Add @grant GM_addValueChangeListener to your local loader and reload open pages to enable live supported-host synchronization.');
+    }
+    syncSupportedHosts();
+  }
+
   async function loadSupportedHosts(forceRefresh = false) {
-    const cachedHosts = normalizeHostList(GM_getValue(STORAGE.hosts, []));
-    const lastUpdated = Number(GM_getValue(STORAGE.hostsUpdated, 0)) || 0;
-    const cacheIsFresh = Date.now() - lastUpdated < HOST_CACHE_MAX_AGE;
-    if (cachedHosts.length) supportedDomains = new Set(cachedHosts);
-    if (!forceRefresh && cacheIsFresh && cachedHosts.length) return true;
-    // Automatic callers share discovery; each explicit refresh supersedes it.
+    const state = syncSupportedHosts();
+    const cacheIsFresh = Date.now() - state.updatedAt < HOST_CACHE_MAX_AGE;
+    if (!forceRefresh && cacheIsFresh && state.hosts.length) return true;
+    // Automatic callers share discovery within this page; explicit refreshes
+    // publish a new generation before starting network work in any tab.
     if (forceRefresh || !supportedHostsRequest) {
-      const generation = ++supportedHostsGeneration;
+      const generation = {
+        clock: Math.max(Date.now(), (state.requested?.clock || 0) + 1),
+        id: Math.random().toString(36).slice(2) || '0'
+      };
+      publishHostState({ ...state, requested: generation });
       const promise = requestJson(`${RD_API_BASE}/hosts/domains`).then(response => {
-        if (generation !== supportedHostsGeneration) return false;
+        const current = syncSupportedHosts();
+        if (compareHostStamps(generation, current.requested) !== 0) return false;
         const freshHosts = normalizeHostList(response);
         if (!freshHosts.length) throw new RequestError('Real-Debrid returned an empty supported-host list.');
-        supportedDomains = new Set(freshHosts);
-        GM_setValue(STORAGE.hosts, freshHosts);
-        GM_setValue(STORAGE.hostsUpdated, Date.now());
+        publishHostState({ ...current, accepted: generation, hosts: freshHosts, updatedAt: Date.now() });
         return true;
       });
       supportedHostsRequest = { generation, promise };
@@ -571,7 +655,7 @@
     try {
       return await request.promise;
     } catch (error) {
-      if (request.generation !== supportedHostsGeneration) return false;
+      if (compareHostStamps(request.generation, syncSupportedHosts().requested) !== 0) return false;
       // A manual refresh must report the API failure even when cached hosts remain usable.
       if (forceRefresh || !supportedDomains.size) throw error;
       console.warn('[RD + JD] Could not refresh supported hosts; using the cached list.', error);
@@ -640,8 +724,7 @@
   }
 
   function describeHostCache(now = Date.now()) {
-    const hosts = normalizeHostList(GM_getValue(STORAGE.hosts, []));
-    const lastUpdated = Number(GM_getValue(STORAGE.hostsUpdated, 0)) || 0;
+    const { hosts, updatedAt: lastUpdated } = syncSupportedHosts();
     if (!hosts.length || !lastUpdated) return `empty (${hosts.length} hosts)`;
     const age = Math.max(0, now - lastUpdated);
     const state = age < HOST_CACHE_MAX_AGE ? 'fresh' : 'stale';
@@ -942,7 +1025,6 @@
     GM_registerMenuCommand('Refresh Real-Debrid supported hosts', async () => {
       try {
         if (!await loadSupportedHosts(true)) return;
-        rescanAllLinks();
         window.alert('The supported-host list was refreshed.');
       } catch (error) {
         const fallback = supportedDomains.size ? '\nThe cached list is still in use.' : '';
@@ -963,6 +1045,7 @@
     try {
       // Keep observing through discovery outages so a later refresh can recover.
       startObserver();
+      startSupportedHostsSync();
       await loadSupportedHosts();
       rescanAllLinks();
     } catch (error) {
