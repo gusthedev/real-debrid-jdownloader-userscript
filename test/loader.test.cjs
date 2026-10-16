@@ -274,3 +274,12 @@ test('warm startup validates cached source only once', () => {
   assert.equal(h.syntaxChecks(), 1);
   assert.equal(h.runs().length, 1);
 });
+
+
+test('loader grants every privileged API required by the shared core', () => {
+  const coreSource = fs.readFileSync(path.join(__dirname, '..', 'real-debrid-jdownloader.user.js'), 'utf8');
+  const grants = source => [...source.matchAll(/^\/\/\s*@grant\s+(\S+)/gm)].map(match => match[1]);
+  const loaderGrants = new Set(grants(loaderSource));
+  for (const grant of grants(coreSource)) assert.ok(loaderGrants.has(grant), `loader must grant ${grant}`);
+  assert.ok(loaderGrants.has('GM_addValueChangeListener'));
+});
