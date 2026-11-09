@@ -66,6 +66,8 @@ Removed anchors and their injected buttons are reconciled in the existing 150 ms
 
 ## Checks
 
+Use Node.js **26.13.0** to match CI.
+
 Run the dependency-free Node test suite with:
 
 ```sh
